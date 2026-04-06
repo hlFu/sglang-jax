@@ -422,6 +422,7 @@ class EPMoE(nnx.Module):
                 scale_name="wo_scale",
             )
 
+            out_specs = P("tensor", None) if len(hidden_states_reshard.shape) == 2 else P(None, "tensor", None)
             result = shard_map(
                 self._forward,
                 mesh=self.moe_mesh,
@@ -442,7 +443,7 @@ class EPMoE(nnx.Module):
                     P("expert", None, "tensor"),
                     P("expert", None, None),
                 ),
-                out_specs=P(None),
+                out_specs=out_specs,
                 check_vma=False,
             )(
                 hidden_states_reshard,
@@ -459,9 +460,7 @@ class EPMoE(nnx.Module):
                 None,
             )
 
-        # Reshard result back to original mesh
-        replicated_pspec = P(*([None] * result.ndim))
-        return jax.sharding.reshard(result, jax.sharding.NamedSharding(self.mesh, replicated_pspec))
+            return result
 
     def _forward(
         self,
@@ -521,7 +520,9 @@ class EPMoE(nnx.Module):
         # All-reduce after unpermute: communication volume is (T, hidden_size)
         # instead of (T * top_k, hidden_size), reducing by a factor of top_k.
         if self.tp_size > 1:
-            output = jax.lax.psum(output, "tensor")
+            # scatter on sequence/token dimension
+            scatter_dimension = 0 if len(output.shape) == 2 else 1
+            output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=scatter_dimension)
         if self.ep_size > 1:
             output = self._combine(output)
 
