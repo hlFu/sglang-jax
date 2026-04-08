@@ -8,6 +8,8 @@ from jax import numpy as jnp
 from jax import shard_map
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+from jax.sharding import reshard
+from jax.sharding import use_abstract_mesh
 
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -231,28 +233,23 @@ class QuantizedLinear(nnx.Module):
         # Weight w_q sharding: P(output_axis, input_axis)
         # Weight scale sharding: P(output_axis) - per output channel
         # Output sharding: P(None, output_axis)
-        in_specs = (
-            P(None, input_axis),  # x
-            P(output_axis, input_axis),  # w_q
-            P(output_axis),  # w_scale
-        )
-        if x_2d.shape[0] >= 64:
-            out_specs = P(input_axis, output_axis)
-        else:
-            out_specs = P(None, output_axis)
 
-        output = shard_map(
-            partial(
-                xla_quantized_matmul_local,
-                quantize_activation=quantize_activation,
-                reduce_axis=input_axis,  # psum over input axis (e.g., "tensor" for o_proj)
-                compute_dtype=self.compute_dtype,
-            ),
-            mesh=self.mesh,
-            in_specs=in_specs,
-            out_specs=out_specs,
-            check_vma=False,
-        )(x_2d, self.weight_q.value, scale_val)
+        with use_abstract_mesh(self.mesh):
+            x_2d = reshard(x_2d, P(None, input_axis))
+            self.weight_q.value = reshard(self.weight_q.value, P(None, input_axis))
+            scale_val = reshard(scale_val, P(output_axis))
+
+        output = xla_quantized_matmul_local(x_2d, self.weight_q.value, scale_val,
+                                    quantize_activation=quantize_activation,
+                reduce_axis=input_axis,  
+                compute_dtype=self.compute_dtype)
+
+        with use_abstract_mesh(self.mesh):
+            if x_2d.shape[0] >= 64:
+                # Sequence parallel
+                output = reshard(output, P(input_axis, output_axis))
+            else:
+                output = reshard(output, P(None, output_axis))
 
         # Reshape back to original batch dimensions
         if x.ndim > 2:
