@@ -656,14 +656,14 @@ class EPMoE(nnx.Module):
             (total_tokens, self.num_experts_per_tok, -1),
         )
 
-        intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
-        weights_fp32 = reshaped_weights.astype(jnp.float32)
+        # intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
+        # weights_fp32 = reshaped_weights.astype(jnp.float32)
 
-        output = jnp.einsum(
-            "BKE,BK -> BE",
-            intermediate_fp32,
-            weights_fp32,
-        )
+        if self.num_experts_per_tok == 2:
+            output = (reshaped_intermediate[:, 0, :] * reshaped_weights[:, 0, None] + 
+                    reshaped_intermediate[:, 1, :] * reshaped_weights[:, 1, None])
+        else:
+            output = jnp.einsum("BKE,BK->BE", reshaped_intermediate, reshaped_weights)
 
         if len(weights.shape) == 2:
             final_output = output.astype(self.dtype)
