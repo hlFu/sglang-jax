@@ -53,7 +53,6 @@ def xla_quantized_matmul_local(
                 x_q,
                 w_q,
                 dimension_numbers=(((1,), (1,)), ((), ())),
-                preferred_element_type=compute_dtype,
                 out_sharding=out_sharding
             )
         else:
@@ -61,7 +60,6 @@ def xla_quantized_matmul_local(
                 x_q,
                 w_q,
                 dimension_numbers=(((1,), (1,)), ((), ())),
-                preferred_element_type=compute_dtype,
             )
 
         # Local dequantization
@@ -76,7 +74,6 @@ def xla_quantized_matmul_local(
                 x,
                 w_q,
                 dimension_numbers=(((1,), (1,)), ((), ())),
-                preferred_element_type=compute_dtype,
                 out_sharding=out_sharding
             )
         else:
@@ -84,7 +81,6 @@ def xla_quantized_matmul_local(
                 x,
                 w_q,
                 dimension_numbers=(((1,), (1,)), ((), ())),
-                preferred_element_type=compute_dtype,
             )
         out = out.astype(compute_dtype)
         out = out * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
