@@ -35,17 +35,34 @@ def xla_quantized_matmul_local(
     out_dtype = x.dtype
     compute_dtype = jnp.float32 if compute_dtype is None else compute_dtype
 
+    out_sharding = None
+    if reduce_axis is not None:
+        if x.shape[0] >= 64:
+            # Sequence parallel
+            out_sharding=jax.sharding.PartitionSpec("tensor", None)
+        else:
+            out_sharding=jax.sharding.PartitionSpec(None, None)
+
     if quantize_activation:
         # Local quantization - each device uses its local max
         x_q, x_scale = quantize_tensor_simple(x, w_q.dtype, dim=-1)
 
-        # Local matmul
-        out = lax.dot_general(
-            x_q,
-            w_q,
-            dimension_numbers=(((1,), (1,)), ((), ())),
-            preferred_element_type=compute_dtype,
-        )
+        if out_sharding:
+            # Local matmul
+            out = lax.dot_general(
+                x_q,
+                w_q,
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=compute_dtype,
+                out_sharding=out_sharding
+            )
+        else:
+            out = lax.dot_general(
+                x_q,
+                w_q,
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=compute_dtype,
+            )
 
         # Local dequantization
         out = out.astype(compute_dtype)
@@ -53,22 +70,25 @@ def xla_quantized_matmul_local(
             out * x_scale.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
         )
     else:
-        # Local matmul without activation quantization
-        out = lax.dot_general(
-            x,
-            w_q,
-            dimension_numbers=(((1,), (1,)), ((), ())),
-            preferred_element_type=compute_dtype,
-        )
+        if out_sharding:
+            # Local matmul without activation quantization
+            out = lax.dot_general(
+                x,
+                w_q,
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=compute_dtype,
+                out_sharding=out_sharding
+            )
+        else:
+            out = lax.dot_general(
+                x,
+                w_q,
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=compute_dtype,
+            )
         out = out.astype(compute_dtype)
         out = out * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
 
     out = out.astype(out_dtype)
-    # Sum partial results across devices (single all-reduce)
-    if reduce_axis is not None:
-        if out.shape[0] >= 64:
-            out = lax.psum_scatter(out, reduce_axis, scatter_dimension=0, tiled=True)
-        else:
-            out = lax.psum(out, reduce_axis)
 
     return out

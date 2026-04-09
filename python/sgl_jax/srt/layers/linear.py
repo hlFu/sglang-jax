@@ -15,6 +15,26 @@ from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_loc
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
+import functools
+
+def log_shardings(name):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            for i, a in enumerate(args):
+                if hasattr(a, 'aval') and hasattr(a.aval, 'sharding'):
+                    print(f"{name} input[{i}]: {a.aval.shape} {a.aval.sharding}")
+            result = fn(*args, **kwargs)
+            if hasattr(result, 'aval') and hasattr(result.aval, 'sharding'):
+                print(f"{name} output: {result.aval.shape} {result.aval.sharding}")
+            elif isinstance(result, tuple):
+                for i, r in enumerate(result):
+                    if hasattr(r, 'aval') and hasattr(r.aval, 'sharding'):
+                        print(f"{name} output[{i}]: {r.aval.shape} {r.aval.sharding}")
+            return result
+        return wrapper
+    return decorator
+
 
 class LinearBase(nnx.Module):
     """Base linear layer.
@@ -68,6 +88,7 @@ class LinearBase(nnx.Module):
             self.bias = None
 
     @named_scope
+    @log_shardings('linear')
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
@@ -199,6 +220,7 @@ class QuantizedLinear(nnx.Module):
         )
 
     @named_scope
+    @log_shardings('quantized_linear')
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass using quantized matmul.
 
@@ -234,9 +256,9 @@ class QuantizedLinear(nnx.Module):
         # Weight scale sharding: P(output_axis) - per output channel
         # Output sharding: P(None, output_axis)
 
-        with use_abstract_mesh(self.mesh):
+        with use_abstract_mesh(self.mesh.abstract_mesh):
             x_2d = reshard(x_2d, P(None, input_axis))
-            self.weight_q.value = reshard(self.weight_q.value, P(None, input_axis))
+            self.weight_q.value = reshard(self.weight_q.value, P(output_axis, input_axis))
             scale_val = reshard(scale_val, P(output_axis))
 
         output = xla_quantized_matmul_local(x_2d, self.weight_q.value, scale_val,
@@ -244,7 +266,7 @@ class QuantizedLinear(nnx.Module):
                 reduce_axis=input_axis,  
                 compute_dtype=self.compute_dtype)
 
-        with use_abstract_mesh(self.mesh):
+        with use_abstract_mesh(self.mesh.abstract_mesh):
             if x_2d.shape[0] >= 64:
                 # Sequence parallel
                 output = reshard(output, P(input_axis, output_axis))
