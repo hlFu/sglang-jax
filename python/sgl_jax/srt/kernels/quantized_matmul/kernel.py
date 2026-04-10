@@ -53,13 +53,15 @@ def xla_quantized_matmul_local(
                 x_q,
                 w_q,
                 dimension_numbers=(((1,), (1,)), ((), ())),
-                out_sharding=out_sharding
+                out_sharding=out_sharding,
+                preferred_element_type=out_dtype,
             )
         else:
             out = lax.dot_general(
                 x_q,
                 w_q,
                 dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=out_dtype,
             )
 
         # Local dequantization
@@ -74,13 +76,15 @@ def xla_quantized_matmul_local(
                 x,
                 w_q,
                 dimension_numbers=(((1,), (1,)), ((), ())),
-                out_sharding=out_sharding
+                out_sharding=out_sharding,
+                preferred_element_type=out_dtype,
             )
         else:
             out = lax.dot_general(
                 x,
                 w_q,
                 dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=out_dtype,
             )
         out = out.astype(compute_dtype)
         out = out * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
