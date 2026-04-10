@@ -11,25 +11,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
-import functools
-
-def log_shardings(name):
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            for i, a in enumerate(args):
-                if hasattr(a, 'aval') and hasattr(a.aval, 'sharding'):
-                    print(f"{name} input[{i}]: {a.aval.shape} {a.aval.sharding}")
-            result = fn(*args, **kwargs)
-            if hasattr(result, 'aval') and hasattr(result.aval, 'sharding'):
-                print(f"{name} output: {result.aval.shape} {result.aval.sharding}")
-            elif isinstance(result, tuple):
-                for i, r in enumerate(result):
-                    if hasattr(r, 'aval') and hasattr(r.aval, 'sharding'):
-                        print(f"{name} output[{i}]: {r.aval.shape} {r.aval.sharding}")
-            return result
-        return wrapper
-    return decorator
+from sgl_jax.debug_utils import log_shardings
 
 
 def _canonicalize_axes(rank: int, axes: Axes) -> tuple[int, ...]:
