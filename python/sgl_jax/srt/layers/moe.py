@@ -395,7 +395,7 @@ class EPMoE(nnx.Module):
             wo_scale = self.wo_scale.value if self.wo_scale is not None else None
 
             if len(hidden_states_reshard.shape) == 2 and hidden_states_reshard.shape[0] >= 64 or len(hidden_states_reshard.shape) == 3 and hidden_states_reshard.shape[1] >= 64:
-                out_specs = P("tensor", None) if len(hidden_states_reshard.shape) == 2 else P(None, "tensor", None)
+                out_specs = P(None, None, unreduced=frozenset({"tensor"})) if len(hidden_states_reshard.shape) == 2 else P(None, None, None, unreduced=frozenset({"tensor"}))
             else:
                 out_specs = P(None)
             result = shard_map(
@@ -437,7 +437,10 @@ class EPMoE(nnx.Module):
 
             # Need to reshard from expert mesh to original mesh
             with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-                result = jax.sharding.reshard(result, out_specs)  # sharded on original mesh
+                if hidden_states_reshard.shape[0] >= 64:
+                    result = jax.sharding.reshard(result, P("tensor", None))  # sharded on original mesh
+                else:
+                    result = jax.sharding.reshard(result, P(None))  # sharded on original mesh
 
             return result
 
@@ -498,13 +501,13 @@ class EPMoE(nnx.Module):
 
         # All-reduce after unpermute: communication volume is (T, hidden_size)
         # instead of (T * top_k, hidden_size), reducing by a factor of top_k.
-        if self.tp_size > 1:
-            if len(output.shape) == 2 and output.shape[0] >= 64 or len(output.shape) == 3 and output.shape[1] >= 64:
-                # scatter on sequence/token dimension
-                scatter_dimension = 0 if len(output.shape) == 2 else 1
-                output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=scatter_dimension, tiled=True)
-            else:
-                output = jax.lax.psum(output, "tensor")
+        # if self.tp_size > 1:
+        #     if len(output.shape) == 2 and output.shape[0] >= 64 or len(output.shape) == 3 and output.shape[1] >= 64:
+        #         # scatter on sequence/token dimension
+        #         scatter_dimension = 0 if len(output.shape) == 2 else 1
+        #         output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=scatter_dimension, tiled=True)
+        #     else:
+        #         output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
             output = self._combine(output)
 
