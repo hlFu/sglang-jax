@@ -10,10 +10,9 @@ from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_si
 
 def xla_quantized_matmul_local(
     x: jax.Array,
-    w_q: jax.Array,
     w_scale: jax.Array,
+    x_scale: jax.Array | None = None,
     quantize_activation: bool = True,
-    reduce_axis: str | None = None,
     compute_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """
@@ -36,34 +35,18 @@ def xla_quantized_matmul_local(
     compute_dtype = jnp.float32 if compute_dtype is None else compute_dtype
 
     if quantize_activation:
-        # Local quantization - each device uses its local max
-        x_q, x_scale = quantize_tensor_simple(x, w_q.dtype, dim=-1)
-
-        # Local matmul
-        out = lax.dot_general(
-            x_q,
-            w_q,
-            dimension_numbers=(((1,), (1,)), ((), ())),
-            preferred_element_type=compute_dtype,
-        )
-
         # Local dequantization
-        out = out.astype(compute_dtype)
-        out = (
-            out * x_scale.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
+        x = x.astype(compute_dtype)
+        x = (
+            x * x_scale.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
         )
     else:
         # Local matmul without activation quantization
-        out = lax.dot_general(
-            x,
-            w_q,
-            dimension_numbers=(((1,), (1,)), ((), ())),
-            preferred_element_type=compute_dtype,
-        )
-        out = out.astype(compute_dtype)
-        out = out * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
+        
+        x = x.astype(compute_dtype)
+        x = x * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
 
-    out = out.astype(out_dtype)
+    x = x.astype(out_dtype)
     # Sum partial results across devices (single all-reduce)
 
-    return out
+    return x

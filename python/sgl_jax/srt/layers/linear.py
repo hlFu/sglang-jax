@@ -14,6 +14,7 @@ from jax.sharding import use_abstract_mesh
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
 
 
 class LinearBase(nnx.Module):
@@ -229,34 +230,71 @@ class QuantizedLinear(nnx.Module):
         input_axis = self.kernel_axes[0]
         output_axis = self.kernel_axes[1]
 
+        with use_abstract_mesh(self.mesh.abstract_mesh):
+            x = reshard(x, P(None, input_axis))
+            self.weight_q.value = reshard(self.weight_q.value, P(output_axis, input_axis))
+            scale_val = reshard(scale_val, P(output_axis))
+
+        # row parallel
+        if input_axis:
+            dot_out_specs = P(None, None, unreduced=frozenset({input_axis}))
+        # column parallel
+        else:
+            dot_out_specs = P(None, output_axis)
+
+        compute_dtype = jnp.float32
+        x_scale = None
+        if quantize_activation:
+            # Local quantization - each device uses its local max
+            x_q, x_scale = quantize_tensor_simple(x, self.weight_q.value.dtype, dim=-1)
+
+            # Local matmul
+            dot_out = lax.dot_general(
+                x_q,
+                self.weight_q.value,
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=compute_dtype,
+                out_sharding=dot_out_specs
+            )
+        else:
+            dot_out = lax.dot_general(
+                x,
+                self.weight_q.value,
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=compute_dtype,
+                out_sharding=dot_out_specs
+            )
+
         # Input x sharding: for row-parallel, x is P(None, input_axis)
         # Weight w_q sharding: P(output_axis, input_axis)
         # Weight scale sharding: P(output_axis) - per output channel
         # Output sharding: P(None, output_axis)
-        in_specs = (
-            P(None, input_axis),  # x
-            P(output_axis, input_axis),  # w_q
-            P(output_axis),  # w_scale
-        )
-        # row parallel
-        if input_axis:
-            out_specs = P(None, None, unreduced=frozenset({input_axis}))
-        # column parallel
-        else:
-            out_specs = P(None, output_axis)
+        
 
-        output = shard_map(
-            partial(
-                xla_quantized_matmul_local,
-                quantize_activation=quantize_activation,
-                reduce_axis=input_axis,  # psum over input axis (e.g., "tensor" for o_proj)
-                compute_dtype=self.compute_dtype,
-            ),
-            mesh=self.mesh,
-            in_specs=in_specs,
-            out_specs=out_specs,
-            check_vma=False,
-        )(x_2d, self.weight_q.value, scale_val)
+        if quantize_activation:
+
+            output = shard_map(
+                partial(
+                    xla_quantized_matmul_local,
+                    quantize_activation=quantize_activation,
+                    compute_dtype=self.compute_dtype,
+                ),
+                mesh=self.mesh,
+                out_specs=dot_out_specs,
+                check_vma=False,
+            )(dot_out, scale_val, x_scale)
+
+        else:
+            output = shard_map(
+                partial(
+                    xla_quantized_matmul_local,
+                    quantize_activation=quantize_activation,
+                    compute_dtype=self.compute_dtype,
+                ),
+                mesh=self.mesh,
+                out_specs=dot_out_specs,
+                check_vma=False,
+            )(dot_out, scale_val)
 
         # row parallel
         if input_axis:
