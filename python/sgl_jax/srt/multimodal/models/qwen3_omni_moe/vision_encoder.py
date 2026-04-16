@@ -7,6 +7,9 @@ from jax.sharding import PartitionSpec as P
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+    Qwen3_5MoeVisionConfig
+)
 
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.linear import LinearBase
@@ -476,7 +479,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
     def __init__(
         self,
-        config: Qwen3OmniMoeVisionEncoderConfig,
+        config: Qwen3OmniMoeVisionEncoderConfig | Qwen3_5MoeVisionConfig,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
