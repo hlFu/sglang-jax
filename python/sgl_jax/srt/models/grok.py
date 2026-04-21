@@ -195,12 +195,22 @@ class Grok1MLP(nnx.Module):
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
         self.reduce_results = reduce_results
+        self.mesh = mesh
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        # Unshard activations if sequence parallel enabled
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            spec = jax.sharding.PartitionSpec(*([None] * len(x.shape)))
+            x = jax.sharding.reshard(x, spec)
+
         gate, _ = self.gate_proj(x)
         up, _ = self.up_proj(x)
         x, _ = self.act_fn(gate, up)
         x, _ = self.down_proj(x)
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            if len(x.shape) == 2 and x.shape[0] >= 64 or len(x.shape) == 3 and x.shape[1] >= 64:
+                out_specs = jax.sharding.PartitionSpec("tensor", None) if len(x.shape) == 2 else jax.sharding.PartitionSpec(None, "tensor", None)
+                x = jax.sharding.reshard(x, out_specs)
         return x
 
 
@@ -283,6 +293,11 @@ class Grok1MoE(nnx.Module):
         hidden_states: jax.Array,
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
+        # Unshard activations if sequence parallel enabled
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
+            hidden_states = jax.sharding.reshard(hidden_states, spec)
+
         # Router computation with soft capping
         router_logits, _ = self.gate(hidden_states)
 
@@ -472,6 +487,7 @@ class Grok1Attention(nnx.Module):
         )
         self.attn.xai_temperature_len = getattr(config, "attn_temperature_len", -1)
 
+    @log_shardings("Attention")
     def __call__(
         self,
         positions: jax.Array,
@@ -482,6 +498,11 @@ class Grok1Attention(nnx.Module):
         # Short circuit for empty sequences
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
+
+        # Unshard activations if sequence parallel enabled
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
+            hidden_states = jax.sharding.reshard(hidden_states, spec)
 
         # Project Q, K, V separately
         q, _ = self.q_proj(hidden_states)
@@ -501,6 +522,12 @@ class Grok1Attention(nnx.Module):
 
         # Project output
         output, _ = self.o_proj(attn_output)
+
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            if len(output.shape) == 2 and output.shape[0] >= 64 or len(output.shape) == 3 and output.shape[1] >= 64:
+                out_specs = jax.sharding.PartitionSpec("tensor", None) if len(output.shape) == 2 else jax.sharding.PartitionSpec(None, "tensor", None)
+                output = jax.sharding.reshard(output, out_specs)
+
         return output, kv_fused
 
 
@@ -606,8 +633,8 @@ class Grok1DecoderLayer(nnx.Module):
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
         """Combine MoE and residual MLP outputs (matches PyTorch implementation)."""
-        mlp_result = self.mlp(x)
-        moe_result, topk_ids = self.block_sparse_moe(x, dispatch_info=dispatch_info)
+        mlp_result = jax.lax.optimization_barrier(self.mlp(x))
+        moe_result, topk_ids = jax.lax.optimization_barrier(self.block_sparse_moe(x, dispatch_info=dispatch_info))
         # Scale factor from the paper: 1/sqrt(2)
         return (mlp_result + moe_result) / 1.4142135623730951, topk_ids
 
@@ -640,12 +667,12 @@ class Grok1DecoderLayer(nnx.Module):
             hidden_states, residual = self.pre_attn_norm(hidden_states), hidden_states
 
         # Self-attention
-        hidden_states, kv_fused = self.self_attn(
+        hidden_states, kv_fused = jax.lax.optimization_barrier(self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
-        )
+        ))
 
         # # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         assert self.post_attn_norm.scale is not None
@@ -856,6 +883,10 @@ class Grok1ForCausalLM(nnx.Module):
             token_to_kv_pool,
             None,
         )
+
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            hidden_states = jax.sharding.reshard(hidden_states, jax.sharding.PartitionSpec(None))
+        
         output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)
 
         return output, layers_kv_fused, True, layers_topk_ids

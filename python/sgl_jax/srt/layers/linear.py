@@ -70,7 +70,15 @@ class LinearBase(nnx.Module):
     @named_scope
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
+<<<<<<< HEAD
         output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
+=======
+        bias = self.bias if not self.skip_bias_add else None
+        if x.shape[0] >= 64:
+            output_pspec = P(*(self.kernel_axes))
+        else:
+            output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
+>>>>>>> 64449417 (fix: change linear_base and quantized linear output sharding for SP)
         output_sharding = NamedSharding(self.mesh, output_pspec)
         out = lax.dot_general(
             x,
@@ -317,6 +325,7 @@ class QuantizedLinear(nnx.Module):
         ):
             scale_val = jnp.squeeze(scale_val, axis=1)
 
+<<<<<<< HEAD
         # Shard specs for shard_map.
         # kernel_axes = (input_axis, output_axis):
         #   row-parallel  (e.g., o_proj): ("tensor", None)
@@ -330,6 +339,21 @@ class QuantizedLinear(nnx.Module):
             w_scale_spec = P(output_axis)
         in_specs = (P(None, input_axis), P(output_axis, input_axis), w_scale_spec)
         out_specs = P(None, output_axis)
+=======
+        # Input x sharding: for row-parallel, x is P(None, input_axis)
+        # Weight w_q sharding: P(output_axis, input_axis)
+        # Weight scale sharding: P(output_axis) - per output channel
+        # Output sharding: P(None, output_axis)
+        in_specs = (
+            P(None, input_axis),  # x
+            P(output_axis, input_axis),  # w_q
+            P(output_axis),  # w_scale
+        )
+        if x_2d.shape[0] >= 64:
+            out_specs = P(input_axis, output_axis)
+        else:
+            out_specs = P(None, output_axis)
+>>>>>>> 64449417 (fix: change linear_base and quantized linear output sharding for SP)
 
         output = shard_map(
             partial(
