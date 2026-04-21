@@ -45,5 +45,8 @@ class GlobalConfig:
         self.enable_precache_with_tracing = True
         self.enable_parallel_encoding = True
 
+        # Control whether row parallel linear/MoE activation needs to be reduce-scattered
+        self.tpu_scatter_min_local_size = 128
+
 
 global_config = GlobalConfig()

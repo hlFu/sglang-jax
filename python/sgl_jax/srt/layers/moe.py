@@ -19,6 +19,7 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor_simple,
 )
 from sgl_jax.srt.utils.weight_utils import WeightMapping
+from sgl_jax.global_config import global_config
 
 
 class EPMoE(nnx.Module):
@@ -37,6 +38,7 @@ class EPMoE(nnx.Module):
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
+        enable_sequence_parallel=False
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
@@ -57,6 +59,7 @@ class EPMoE(nnx.Module):
         self.mesh = mesh
         self.activation = activation
         self.hidden_size = hidden_size
+        self.enable_sequence_parallel = enable_sequence_parallel
 
         # Get quantization settings from config
         self.quantized_dtype = (
@@ -427,6 +430,10 @@ class EPMoE(nnx.Module):
                 scale_name="wo_scale",
             )
 
+            if self.enable_sequence_parallel and hidden_states.shape[0] >= self.tp_size * global_config.tpu_scatter_min_local_size:
+                out_specs = P("tensor", None) 
+            else:
+                out_specs = P(None)
             result = shard_map(
                 self._forward,
                 mesh=self.moe_mesh,
@@ -447,7 +454,7 @@ class EPMoE(nnx.Module):
                     P("expert", None, "tensor"),
                     P("expert", None, None),
                 ),
-                out_specs=P(None),
+                out_specs=out_specs,
                 check_vma=False,
             )(
                 hidden_states_reshard,
@@ -464,9 +471,11 @@ class EPMoE(nnx.Module):
                 None,
             )
 
-        # Reshard result back to original mesh
-        replicated_pspec = P(*([None] * result.ndim))
-        return jax.sharding.reshard(result, jax.sharding.NamedSharding(self.mesh, replicated_pspec))
+            # Need to reshard from expert mesh to original mesh
+            with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+                result = jax.sharding.reshard(result, out_specs)  # sharded on original mesh
+
+            return result
 
     def _forward(
         self,
@@ -527,10 +536,14 @@ class EPMoE(nnx.Module):
         # All-reduce after unpermute: communication volume is (T, hidden_size)
         # instead of (T * top_k, hidden_size), reducing by a factor of top_k.
         if self.tp_size > 1:
-            output = jax.lax.psum(output, "tensor")
+            if self.enable_sequence_parallel and output.shape[0] >= self.tp_size * global_config.tpu_scatter_min_local_size:
+                # scatter on sequence/token dimension
+                output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)
+            else:
+                output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
             output = self._combine(output)
-
+                                
         return output
 
     def _gmm_compute(
