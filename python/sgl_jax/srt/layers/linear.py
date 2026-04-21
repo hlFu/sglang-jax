@@ -11,6 +11,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import expand_block_scale
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
+from sgl_jax.srt.utils.parallel_utils import should_scatter
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
@@ -39,6 +40,7 @@ class LinearBase(nnx.Module):
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         kernel_axes: Sequence[str | None] | None = None,
         scope_name: str = "linear_base",
+        output_scatter_dimension: int | None = None,
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
@@ -46,6 +48,7 @@ class LinearBase(nnx.Module):
         self.kernel_axes = kernel_axes
         self.mesh = mesh
         self.name = scope_name
+        self.output_scatter_dimension = output_scatter_dimension
 
         self.weight = nnx.Param(
             jax.random.normal(
@@ -128,6 +131,7 @@ class QuantizedLinear(nnx.Module):
         compute_dtype: jnp.dtype | None = None,
         weight_block_size: tuple[int, int] | None = None,
         scope_name: str = "quantized_linear",
+        output_scatter_dimension: int | None = None,
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
         # Auto-expand 2D block-quant scale to 3D kernel-ready layout.
@@ -154,6 +158,7 @@ class QuantizedLinear(nnx.Module):
         self.compute_dtype = compute_dtype
         self.weight_block_size = weight_block_size
         self.name = scope_name
+        self.output_scatter_dimension = output_scatter_dimension
 
     @classmethod
     def from_linear(
@@ -290,6 +295,7 @@ class QuantizedLinear(nnx.Module):
             params_dtype=linear.params_dtype,
             weight_block_size=effective_weight_block_size,
             scope_name=f"quantized_{linear.name}",
+            output_scatter_dimension=linear.output_scatter_dimension,
         )
 
     @named_scope
@@ -329,7 +335,21 @@ class QuantizedLinear(nnx.Module):
             # Per-channel scale: [n_out]
             w_scale_spec = P(output_axis)
         in_specs = (P(None, input_axis), P(output_axis, input_axis), w_scale_spec)
+
         out_specs = P(None, output_axis)
+        if self.output_scatter_dimension is not None and should_scatter(
+            x.shape[self.output_scatter_dimension], self.mesh.shape[input_axis]
+        ):
+            assert out_specs[self.output_scatter_dimension] is None, (
+                f"output_scatter_dimension={self.output_scatter_dimension} must map to a "
+                f"replicated axis in out_specs, got {out_specs}"
+            )
+            out_specs = P(
+                *(
+                    input_axis if i == self.output_scatter_dimension else axis
+                    for i, axis in enumerate(out_specs)
+                )
+            )
 
         output = shard_map(
             partial(
@@ -339,6 +359,7 @@ class QuantizedLinear(nnx.Module):
                 compute_dtype=self.compute_dtype,
                 weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
+                output_scatter_dimension=self.output_scatter_dimension,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
