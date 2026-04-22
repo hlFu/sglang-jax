@@ -12,6 +12,8 @@ from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
 )
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
 
+from sgl_jax.global_config import global_config
+
 
 def xla_quantized_matmul_local(
     x: jax.Array,
@@ -22,6 +24,7 @@ def xla_quantized_matmul_local(
     compute_dtype: jnp.dtype | None = None,
     weight_block_size: tuple[int, int] | None = None,
     activation_quant_dtype: jnp.dtype | None = None,
+    output_scatter_dimension: int | None = None
 ) -> jax.Array:
     """
     Local quantized matmul for use inside shard_map.
@@ -124,8 +127,9 @@ def xla_quantized_matmul_local(
     out = out.astype(out_dtype)
     # Sum partial results across devices (single all-reduce)
     if reduce_axis is not None:
-        if out.shape[0] >= 64:
-            out = lax.psum_scatter(out, reduce_axis, scatter_dimension=0, tiled=True)
+        mesh = jax.sharding.get_abstract_mesh()
+        if output_scatter_dimension is not None and out.shape[output_scatter_dimension] >= mesh.shape[reduce_axis] * global_config.tpu_scatter_min_local_size:
+            out = lax.psum_scatter(out, axis_name=reduce_axis, scatter_dimension=output_scatter_dimension, tiled=True)
         else:
             out = lax.psum(out, axis_name=reduce_axis)
 

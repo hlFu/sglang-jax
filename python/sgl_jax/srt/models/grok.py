@@ -35,6 +35,8 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
+from sgl_jax.global_config import global_config
+
 logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
@@ -165,6 +167,7 @@ class Grok1MLP(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         reduce_results: bool = True,
+        enable_sequence_parallel: bool = False
     ) -> None:
         super().__init__()
 
@@ -191,11 +194,13 @@ class Grok1MLP(nnx.Module):
             params_dtype=dtype,
             kernel_axes=("tensor", None),
             mesh=mesh,
+            output_scatter_dimension=0
         )
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
         self.reduce_results = reduce_results
         self.mesh = mesh
+        self.enable_sequence_parallel = enable_sequence_parallel
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # Unshard activations if sequence parallel enabled
@@ -207,10 +212,6 @@ class Grok1MLP(nnx.Module):
         up, _ = self.up_proj(x)
         x, _ = self.act_fn(gate, up)
         x, _ = self.down_proj(x)
-        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-            if len(x.shape) == 2 and x.shape[0] >= 64 or len(x.shape) == 3 and x.shape[1] >= 64:
-                out_specs = jax.sharding.PartitionSpec("tensor", None) if len(x.shape) == 2 else jax.sharding.PartitionSpec(None, "tensor", None)
-                x = jax.sharding.reshard(x, out_specs)
         return x
 
 
@@ -286,6 +287,7 @@ class Grok1MoE(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 quantization_config=getattr(config, "quantization_config", None),
+                enable_sequence_parallel=getattr(config, "enable_sequence_parallel", None),
             )
 
     def __call__(
@@ -396,6 +398,7 @@ class Grok1Attention(nnx.Module):
         layer_id: int = 0,
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
+        enable_sequence_parallel: int | None = None
     ) -> None:
         super().__init__()
         self.config = config
@@ -411,6 +414,7 @@ class Grok1Attention(nnx.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.mesh = mesh
+        self.enable_sequence_parallel = enable_sequence_parallel
 
         rope_scaling = get_rope_scaling(config)
         self.rope_rotate_half_dims = getattr(config, "rope_rotate_half_dims", False)
@@ -450,6 +454,7 @@ class Grok1Attention(nnx.Module):
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
             mesh=mesh,
+            output_scatter_dimension=0
         )
 
         # Initialize rotary embeddings based on scaling configuration
@@ -487,7 +492,6 @@ class Grok1Attention(nnx.Module):
         )
         self.attn.xai_temperature_len = getattr(config, "attn_temperature_len", -1)
 
-    @log_shardings("Attention")
     def __call__(
         self,
         positions: jax.Array,
@@ -522,11 +526,6 @@ class Grok1Attention(nnx.Module):
 
         # Project output
         output, _ = self.o_proj(attn_output)
-
-        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-            if len(output.shape) == 2 and output.shape[0] >= 64 or len(output.shape) == 3 and output.shape[1] >= 64:
-                out_specs = jax.sharding.PartitionSpec("tensor", None) if len(output.shape) == 2 else jax.sharding.PartitionSpec(None, "tensor", None)
-                output = jax.sharding.reshard(output, out_specs)
 
         return output, kv_fused
 
@@ -591,6 +590,7 @@ class Grok1DecoderLayer(nnx.Module):
                     layer_id=layer_id,
                     reduce_results=False,
                     mesh=mesh,
+                    enable_sequence_parallel=getattr(config, "enable_sequence_parallel", None),
                 )
         else:
             raise NotImplementedError()
@@ -633,8 +633,8 @@ class Grok1DecoderLayer(nnx.Module):
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
         """Combine MoE and residual MLP outputs (matches PyTorch implementation)."""
-        mlp_result = jax.lax.optimization_barrier(self.mlp(x))
-        moe_result, topk_ids = jax.lax.optimization_barrier(self.block_sparse_moe(x, dispatch_info=dispatch_info))
+        mlp_result = self.mlp(x)
+        moe_result, topk_ids = self.block_sparse_moe(x, dispatch_info=dispatch_info)
         # Scale factor from the paper: 1/sqrt(2)
         return (mlp_result + moe_result) / 1.4142135623730951, topk_ids
 
@@ -667,12 +667,12 @@ class Grok1DecoderLayer(nnx.Module):
             hidden_states, residual = self.pre_attn_norm(hidden_states), hidden_states
 
         # Self-attention
-        hidden_states, kv_fused = jax.lax.optimization_barrier(self.self_attn(
+        hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
-        ))
+        )
 
         # # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         assert self.post_attn_norm.scale is not None

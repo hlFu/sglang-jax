@@ -295,6 +295,9 @@ class ModelRunner(BaseModelRunner):
             self.server_args.ep_num_redundant_experts
         )
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
+        self.model_config.hf_config.enable_sequence_parallel = (
+            self.server_args.enable_sequence_parallel
+        )
 
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
