@@ -146,9 +146,10 @@ class FlashAttention(AttentionBackend):
         )
 
         # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
+        # Use [N,N,N] for decode-only batches so the FA kernel dispatches through
+        # the decode path rather than the slower mixed path (upstream commit febb350c).
         if batch.forward_mode == ForwardMode.DECODE:
-            # All sequences are decode/mixed mode
-            distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
+            distribution = np.array([num_seqs.item(), num_seqs.item(), num_seqs.item()], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
             # All sequences are prefill mode
             distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
