@@ -13,13 +13,13 @@ from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
+from sgl_jax.srt.utils.parallel_utils import should_scatter
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
     quantize_tensor_simple,
 )
 from sgl_jax.srt.utils.weight_utils import WeightMapping
-from sgl_jax.global_config import global_config
 
 
 class EPMoE(nnx.Module):
@@ -38,7 +38,7 @@ class EPMoE(nnx.Module):
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
-        enable_sequence_parallel=False
+        enable_sequence_parallel=False,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
@@ -430,8 +430,10 @@ class EPMoE(nnx.Module):
                 scale_name="wo_scale",
             )
 
-            if self.enable_sequence_parallel and hidden_states.shape[0] >= self.tp_size * global_config.tpu_scatter_min_local_size:
-                out_specs = P("tensor", None) 
+            if self.enable_sequence_parallel and should_scatter(
+                hidden_states.shape[0], self.tp_size
+            ):
+                out_specs = P("tensor", None)
             else:
                 out_specs = P(None)
             result = shard_map(
@@ -536,14 +538,14 @@ class EPMoE(nnx.Module):
         # All-reduce after unpermute: communication volume is (T, hidden_size)
         # instead of (T * top_k, hidden_size), reducing by a factor of top_k.
         if self.tp_size > 1:
-            if self.enable_sequence_parallel and output.shape[0] >= self.tp_size * global_config.tpu_scatter_min_local_size:
+            if self.enable_sequence_parallel and should_scatter(output.shape[0], self.tp_size):
                 # scatter on sequence/token dimension
                 output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)
             else:
                 output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
             output = self._combine(output)
-                                
+
         return output
 
     def _gmm_compute(
