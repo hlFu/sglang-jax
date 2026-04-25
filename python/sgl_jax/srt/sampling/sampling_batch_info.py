@@ -191,6 +191,20 @@ class SamplingMetadata:
                 target_shape, linear_penalty_sharding
             )
 
+        # Force vocab_mask to a replicated jax.Array. If we leave it as a raw
+        # numpy ndarray the JIT input-sharding inference can pick a partial-
+        # replicate GSPMD layout (e.g. devices=[1,4,2]<=[8] last_tile_dim_replicate)
+        # whenever the mask's last dim (vocab_size//32) is divisible by some
+        # factor of tp_size but not by tp_size itself — the layout then fails
+        # _gspmd_to_named_sharding_via_mesh on our flat ('data', 'tensor') mesh.
+        if batch.sampling_info.vocab_mask is not None:
+            vocab_mask_device = device_array(
+                batch.sampling_info.vocab_mask,
+                sharding=sharding,
+            )
+        else:
+            vocab_mask_device = None
+
         return cls(
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
@@ -205,7 +219,7 @@ class SamplingMetadata:
             need_min_p_sampling=batch.sampling_info.need_min_p_sampling,
             linear_penalty=linear_penalty_device,
             do_penalties=do_penalties,
-            vocab_mask=batch.sampling_info.vocab_mask,
+            vocab_mask=vocab_mask_device,
         )
 
 
