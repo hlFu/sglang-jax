@@ -38,6 +38,7 @@ from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
 )
+from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -525,12 +526,24 @@ class ModelWorker:
                 batch.sampling_info.update_grammar_vocab_mask()
         if batch.sampling_info.vocab_mask is None:
             sampling_metadata.apply_vocab_mask = False
-            sampling_metadata.vocab_mask = allocate_token_bitmask(
+            mask_np = allocate_token_bitmask(
                 len(batch.sampling_info.temperatures), batch.sampling_info.vocab_size
             )
         else:
             sampling_metadata.apply_vocab_mask = True
-            sampling_metadata.vocab_mask = batch.sampling_info.vocab_mask
+            mask_np = batch.sampling_info.vocab_mask
+        # Place vocab_mask as a replicated jax.Array. The bitmask's last dim is
+        # vocab_size//32 which is divisible by some factor of tp_size but not
+        # by tp_size itself; if we leave it as a numpy ndarray the JIT input-
+        # sharding inference picks a partial-replicate GSPMD layout
+        # (devices=[1,4,2]<=[8] last_tile_dim_replicate) which then fails
+        # _gspmd_to_named_sharding_via_mesh on the flat ('data','tensor') mesh.
+        rep_sharding = (
+            jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+            if jax.process_count() == 1
+            else None
+        )
+        sampling_metadata.vocab_mask = device_array(mask_np, sharding=rep_sharding)
 
     def forward_batch_generation(
         self,
@@ -554,6 +567,30 @@ class ModelWorker:
             forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
+
+        # Hybrid linear-attention (Qwen3-Next) prep: pre-compute scatter/gather
+        # metadata for the gated DeltaNet prefill path and translate the
+        # request-pool indices to mamba-slot indices before JIT. Non-hybrid
+        # runs leave both fields as None.
+        if getattr(self.worker.model_runner, "is_hybrid_linear", False):
+            from sgl_jax.srt.layers.attention.fla.linear_attention_backend import (
+                LinearAttentionBackend,
+            )
+
+            linear_backend = getattr(
+                self.worker.model_runner,
+                "linear_attn_backend",
+                None,
+            )
+            if linear_backend is None:
+                linear_backend = LinearAttentionBackend(mesh=self.worker.model_runner.mesh)
+                self.worker.model_runner.linear_attn_backend = linear_backend
+            forward_batch.linear_attn_metadata = linear_backend.get_forward_metadata(
+                model_worker_batch
+            )
+            req_pool = self.worker.model_runner.req_to_token_pool
+            mamba_idx_np = req_pool.get_mamba_indices(model_worker_batch.req_pool_indices)
+            forward_batch.mamba_cache_indices = jnp.asarray(mamba_idx_np, dtype=jnp.int32)
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(

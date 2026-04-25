@@ -35,6 +35,7 @@ from sgl_jax.srt.mem_cache.allocator import (
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sgl_jax.srt.mem_cache.mamba_pool import HybridReqToTokenPool, MambaPool
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
@@ -89,6 +90,11 @@ class ModelRunner(BaseModelRunner):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = False
+        # Hybrid linear-attention (gated DeltaNet) models: Qwen3-Next etc.
+        self.is_hybrid_linear = False
+        self.num_full_attn_layers = 0
+        self.num_linear_layers = 0
+        self.mamba_pool: MambaPool | None = None
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
@@ -145,6 +151,22 @@ class ModelRunner(BaseModelRunner):
             and self.sliding_window_size > 0
         ):
             self.is_hybrid = True
+
+        # Check if the model is hybrid linear-attention (Qwen3-Next / gated DeltaNet).
+        # The model module exposes num_full_attn_layers / num_linear_layers when so.
+        inner_model = getattr(self.model, "model", None)
+        if inner_model is not None and hasattr(inner_model, "num_linear_layers"):
+            n_linear = int(getattr(inner_model, "num_linear_layers", 0))
+            n_full = int(getattr(inner_model, "num_full_attn_layers", 0))
+            if n_linear > 0:
+                self.is_hybrid_linear = True
+                self.num_linear_layers = n_linear
+                self.num_full_attn_layers = n_full
+                logger.info(
+                    "Hybrid linear attention detected: %d full-attn + %d linear-attn layers",
+                    n_full,
+                    n_linear,
+                )
 
         # Init lora
         if server_args.enable_lora:
@@ -222,6 +244,31 @@ class ModelRunner(BaseModelRunner):
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, token_to_kv_pool, logits_metadata)
 
+        @partial(
+            jax.jit,
+            donate_argnames=["token_to_kv_pool", "mamba_pool"],
+            static_argnames=["model_state_def"],
+            compiler_options=jit_compiler_options,
+        )
+        def jitted_run_model_hybrid(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            forward_batch,
+            token_to_kv_pool,
+            mamba_pool,
+            logits_metadata,
+        ):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            with LoraBatchContext.set_batch(forward_batch):
+                return model(
+                    forward_batch,
+                    token_to_kv_pool,
+                    logits_metadata,
+                    mamba_pool=mamba_pool,
+                )
+
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
         # the eager jax.random.split that would serialize the host-device pipeline.
@@ -240,9 +287,22 @@ class ModelRunner(BaseModelRunner):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
             rng_key = jax.random.fold_in(base_rng_key, rng_step)
-            return sampler(
+            out = sampler(
                 *args, use_sort_for_toppk_minp=use_sort_for_toppk_minp, rng_override=rng_key
             )
+            # Pin every jax.Array leaf of the return pytree to a replicated
+            # NamedSharding. Without this, GSPMD sometimes invents a
+            # partial-replicate layout like devices=[1,4,2]<=[8] which
+            # _gspmd_to_named_sharding_via_mesh cannot map onto our flat
+            # ('data', 'tensor') mesh and raises IndivisibleError.
+            rep = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+
+            def _pin_replicated(x):
+                if isinstance(x, jax.Array):
+                    return jax.lax.with_sharding_constraint(x, rep)
+                return x
+
+            return jax.tree_util.tree_map(_pin_replicated, out)
 
         @partial(jax.jit, static_argnames=["mesh"])
         def jitted_compute_logprobs(mesh, logits, next_tokens):
@@ -250,6 +310,23 @@ class ModelRunner(BaseModelRunner):
 
         def run_model_wrapper(forward_batch, logits_metadata):
             token_to_kv_pool = self.token_to_kv_pool
+            if self.is_hybrid_linear:
+                out, kv_fused, ok, topk_ids, new_mamba_pool = jitted_run_model_hybrid(
+                    model_def,
+                    model_state_def,
+                    self.model_state_leaves,
+                    forward_batch,
+                    token_to_kv_pool,
+                    self.mamba_pool,
+                    logits_metadata,
+                )
+                # The donated input arrays were consumed; update *both*
+                # references so the host-side host pool that the
+                # HybridReqToTokenPool holds points to the live arrays too.
+                self.mamba_pool = new_mamba_pool
+                if hasattr(self.req_to_token_pool, "mamba_pool"):
+                    self.req_to_token_pool.mamba_pool = new_mamba_pool
+                return out, kv_fused, ok, topk_ids
             return jitted_run_model(
                 model_def,
                 model_state_def,
@@ -372,6 +449,12 @@ class ModelRunner(BaseModelRunner):
     def adjust_layer_num(self):
         """For hybrid models, compute effective layer count accounting for
         SWA layers having potentially different KV head counts."""
+        # Hybrid linear-attention (Qwen3-Next): KV cache is only for full-attn
+        # layers; linear layers use MambaPool instead. Use the dense full-attn
+        # count for memory profiling so token budget is not over-reserved.
+        if self.is_hybrid_linear and self.num_full_attn_layers > 0:
+            return self.num_full_attn_layers
+
         if not self.is_hybrid:
             return self.model_config.num_hidden_layers
 
@@ -518,11 +601,52 @@ class ModelRunner(BaseModelRunner):
 
         # Create request to token pool if not already created
         if self.req_to_token_pool is None:
-            self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs + 1,
-                max_context_len=self.model_config.context_len + 4,
-                dtype=np.int32,
-            )
+            if self.is_hybrid_linear:
+                # Hybrid linear-attention models carry a per-request recurrent
+                # + conv state for the gated DeltaNet layers alongside the
+                # standard req → token slot map. Allocating both together keeps
+                # the two free-lists synchronised with request lifecycle.
+                hf = self.model_config.hf_config
+                num_v_heads = hf.linear_num_value_heads
+                num_k_heads = hf.linear_num_key_heads
+                head_k_dim = hf.linear_key_head_dim
+                head_v_dim = hf.linear_value_head_dim
+                conv_kernel = hf.linear_conv_kernel_dim
+                conv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+                # Enter the mesh context so the pool's sharded zeros tensors
+                # can be materialised with P(None, None, "tensor", ...).
+                with jax.set_mesh(self.mesh):
+                    hybrid_req_pool = HybridReqToTokenPool(
+                        size=max_num_reqs + 1,
+                        max_context_len=self.model_config.context_len + 4,
+                        num_linear_layers=self.num_linear_layers,
+                        conv_dim=conv_dim,
+                        conv_state_len=conv_kernel - 1,
+                        num_heads=num_v_heads,
+                        head_k_dim=head_k_dim,
+                        head_v_dim=head_v_dim,
+                        state_dtype=self.dtype,
+                        dtype=np.int32,
+                        mesh=self.mesh,
+                    )
+                self.req_to_token_pool = hybrid_req_pool
+                self.mamba_pool = hybrid_req_pool.mamba_pool
+                logger.info(
+                    "HybridReqToTokenPool created: size=%d, conv_dim=%d, "
+                    "num_linear_layers=%d, heads=%d, head_k=%d, head_v=%d",
+                    max_num_reqs + 1,
+                    conv_dim,
+                    self.num_linear_layers,
+                    num_v_heads,
+                    head_k_dim,
+                    head_v_dim,
+                )
+            else:
+                self.req_to_token_pool = ReqToTokenPool(
+                    size=max_num_reqs + 1,
+                    max_context_len=self.model_config.context_len + 4,
+                    dtype=np.int32,
+                )
 
         # Create KV cache pool
         if self.is_hybrid:
@@ -545,13 +669,20 @@ class ModelRunner(BaseModelRunner):
                 mesh=self.mesh,
             )
         else:
+            # For hybrid linear-attention models the KV pool only holds full-attn
+            # layers; linear layers use the MambaPool instead.
+            kv_layer_num = (
+                self.num_full_attn_layers
+                if self.is_hybrid_linear
+                else self.model_config.num_hidden_layers
+            )
             self.token_to_kv_pool = MHATokenToKVPool(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
-                layer_num=self.model_config.num_hidden_layers,
+                layer_num=kv_layer_num,
                 mesh=self.mesh,
             )
 
