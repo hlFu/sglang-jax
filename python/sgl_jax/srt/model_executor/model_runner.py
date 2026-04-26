@@ -35,9 +35,10 @@ from sgl_jax.srt.mem_cache.allocator import (
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sgl_jax.srt.mem_cache.mamba_pool import HybridReqToTokenPool, MambaPool
 from sgl_jax.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
     MHATokenToKVPool,
+    RecurrentStatePool,
     ReqToTokenPool,
     SWAKVPool,
 )
@@ -94,7 +95,7 @@ class ModelRunner(BaseModelRunner):
         self.is_hybrid_linear = False
         self.num_full_attn_layers = 0
         self.num_linear_layers = 0
-        self.mamba_pool: MambaPool | None = None
+        self.recurrent_state_pool: RecurrentStatePool | None = None
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
@@ -246,7 +247,7 @@ class ModelRunner(BaseModelRunner):
 
         @partial(
             jax.jit,
-            donate_argnames=["token_to_kv_pool", "mamba_pool"],
+            donate_argnames=["token_to_kv_pool", "recurrent_state_pool"],
             static_argnames=["model_state_def"],
             compiler_options=jit_compiler_options,
         )
@@ -256,7 +257,7 @@ class ModelRunner(BaseModelRunner):
             model_state_leaves,
             forward_batch,
             token_to_kv_pool,
-            mamba_pool,
+            recurrent_state_pool,
             logits_metadata,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
@@ -266,7 +267,7 @@ class ModelRunner(BaseModelRunner):
                     forward_batch,
                     token_to_kv_pool,
                     logits_metadata,
-                    mamba_pool=mamba_pool,
+                    recurrent_state_pool=recurrent_state_pool,
                 )
 
         # Capture base RNG key as a constant in the JIT closure.
@@ -311,21 +312,21 @@ class ModelRunner(BaseModelRunner):
         def run_model_wrapper(forward_batch, logits_metadata):
             token_to_kv_pool = self.token_to_kv_pool
             if self.is_hybrid_linear:
-                out, kv_fused, ok, topk_ids, new_mamba_pool = jitted_run_model_hybrid(
+                out, kv_fused, ok, topk_ids, new_recurrent_state_pool = jitted_run_model_hybrid(
                     model_def,
                     model_state_def,
                     self.model_state_leaves,
                     forward_batch,
                     token_to_kv_pool,
-                    self.mamba_pool,
+                    self.recurrent_state_pool,
                     logits_metadata,
                 )
                 # The donated input arrays were consumed; update *both*
                 # references so the host-side host pool that the
                 # HybridReqToTokenPool holds points to the live arrays too.
-                self.mamba_pool = new_mamba_pool
-                if hasattr(self.req_to_token_pool, "mamba_pool"):
-                    self.req_to_token_pool.mamba_pool = new_mamba_pool
+                self.recurrent_state_pool = new_recurrent_state_pool
+                if hasattr(self.req_to_token_pool, "recurrent_state_pool"):
+                    self.req_to_token_pool.recurrent_state_pool = new_recurrent_state_pool
                 return out, kv_fused, ok, topk_ids
             return jitted_run_model(
                 model_def,
@@ -450,7 +451,7 @@ class ModelRunner(BaseModelRunner):
         """For hybrid models, compute effective layer count accounting for
         SWA layers having potentially different KV head counts."""
         # Hybrid linear-attention (Qwen3-Next): KV cache is only for full-attn
-        # layers; linear layers use MambaPool instead. Use the dense full-attn
+        # layers; linear layers use RecurrentStatePool instead. Use the dense full-attn
         # count for memory profiling so token budget is not over-reserved.
         if self.is_hybrid_linear and self.num_full_attn_layers > 0:
             return self.num_full_attn_layers
@@ -630,7 +631,7 @@ class ModelRunner(BaseModelRunner):
                         mesh=self.mesh,
                     )
                 self.req_to_token_pool = hybrid_req_pool
-                self.mamba_pool = hybrid_req_pool.mamba_pool
+                self.recurrent_state_pool = hybrid_req_pool.recurrent_state_pool
                 logger.info(
                     "HybridReqToTokenPool created: size=%d, conv_dim=%d, "
                     "num_linear_layers=%d, heads=%d, head_k=%d, head_v=%d",
@@ -670,7 +671,7 @@ class ModelRunner(BaseModelRunner):
             )
         else:
             # For hybrid linear-attention models the KV pool only holds full-attn
-            # layers; linear layers use the MambaPool instead.
+            # layers; linear layers use the RecurrentStatePool instead.
             kv_layer_num = (
                 self.num_full_attn_layers
                 if self.is_hybrid_linear

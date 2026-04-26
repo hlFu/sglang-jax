@@ -1,4 +1,4 @@
-"""Unit tests for MambaPool and HybridReqToTokenPool."""
+"""Unit tests for RecurrentStatePool and HybridReqToTokenPool."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ import unittest
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.mem_cache.mamba_pool import HybridReqToTokenPool, MambaPool
+from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, RecurrentStatePool
 
 
-class TestMambaPool(unittest.TestCase):
+class TestRecurrentStatePool(unittest.TestCase):
     def setUp(self):
-        self.pool = MambaPool(
+        self.pool = RecurrentStatePool(
             size=4,
             num_layers=2,
             conv_dim=6,
@@ -103,18 +103,18 @@ class TestHybridReqToTokenPool(unittest.TestCase):
         pool = self._make()
         req_slots = pool.alloc(4)
         self.assertIsNotNone(req_slots)
-        self.assertEqual(pool.mamba_pool.available_size(), 0)
+        self.assertEqual(pool.recurrent_state_pool.available_size(), 0)
         pool.free(req_slots)
-        self.assertEqual(pool.mamba_pool.available_size(), 4)
+        self.assertEqual(pool.recurrent_state_pool.available_size(), 4)
         self.assertEqual(pool.available_size(), 4)
         # req_to_mamba must be zeroed for freed reqs.
         self.assertTrue(np.all(pool.req_to_mamba == 0))
 
-    def test_mamba_pool_exhaustion_rolls_back_req(self):
+    def test_recurrent_state_pool_exhaustion_rolls_back_req(self):
         pool = self._make()
         # Manually drain mamba pool.
-        pool.mamba_pool.alloc(4)
-        # Now super().alloc can still succeed, but mamba_pool.alloc must fail.
+        pool.recurrent_state_pool.alloc(4)
+        # Now super().alloc can still succeed, but recurrent_state_pool.alloc must fail.
         result = pool.alloc(1)
         self.assertIsNone(result)
         # Req pool slots must have been rolled back.

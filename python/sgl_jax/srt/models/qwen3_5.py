@@ -8,7 +8,7 @@ a sparse MoE (routed experts + shared expert).
 This module is the Flax NNX port of
 ``transformers.models.qwen3_next.modeling_qwen3_next``. The kernels live in
 ``sgl_jax.srt.kernels.gated_delta``; the recurrent state pool lives in
-``sgl_jax.srt.mem_cache.mamba_pool``.
+``sgl_jax.srt.mem_cache.recurrent_state_pool``.
 """
 
 from __future__ import annotations
@@ -35,8 +35,7 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.mem_cache.mamba_pool import MambaPool
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen3 import Qwen3MLP
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -70,7 +69,7 @@ def full_attention_layer_ids(config) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-class Qwen3NextFullAttention(nnx.Module):
+class Qwen3_5FullAttention(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -170,7 +169,7 @@ class Qwen3NextFullAttention(nnx.Module):
         k, _ = self.k_proj(hidden_states)  # [T, kv_heads*head_dim]
         v, _ = self.v_proj(hidden_states)
         T = hidden_states.shape[0]
-        # HF layout (Qwen3NextAttention.forward):
+        # HF layout (Qwen3_5Attention.forward):
         #     self.q_proj(x).view(*input_shape, -1, head_dim * 2)   -> (T, q_heads, 2*head_dim)
         #     query_states, gate = torch.chunk(..., 2, dim=-1)
         # i.e. for each head h the q_proj emits [q_h(head_dim), gate_h(head_dim)]
@@ -197,10 +196,10 @@ class Qwen3NextFullAttention(nnx.Module):
 # ---------------------------------------------------------------------------
 
 
-class Qwen3NextGatedDeltaNet(nnx.Module):
+class Qwen3_5GatedDeltaNet(nnx.Module):
     """Gated DeltaNet linear-attention layer — shape-correct port of HF ref.
 
-    Weight shapes follow HuggingFace ``Qwen3NextGatedDeltaNet``:
+    Weight shapes follow HuggingFace ``Qwen3_5GatedDeltaNet``:
 
         in_proj_qkvz:   [hidden, 2*key_dim + 2*value_dim]
         in_proj_ba:     [hidden, 2*num_v_heads]
@@ -216,7 +215,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        mamba_layer_id: int,  # dense index into MambaPool (0..num_linear-1)
+        mamba_layer_id: int,  # dense index into RecurrentStatePool (0..num_linear-1)
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
@@ -342,7 +341,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         return q, k, v, z, b, a
 
     def _rms_gate(self, core_attn_out: jax.Array, z: jax.Array) -> jax.Array:
-        """Equivalent of HF ``Qwen3NextRMSNormGated(norm(core) * silu(z))``.
+        """Equivalent of HF ``Qwen3_5RMSNormGated(norm(core) * silu(z))``.
 
         Input ``core_attn_out`` and ``z`` have shape ``[T, num_v_heads, head_v_dim]``.
         """
@@ -371,7 +370,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         attention metadata already on ``forward_batch``.
         """
         T = hidden_states.shape[0]
-        # MambaPool leaves replicated; reshape to the tensor-sharded layout the
+        # RecurrentStatePool leaves replicated; reshape to the tensor-sharded layout the
         # activations live in so subsequent concats / ops see consistent sharding.
         conv_state_in = jax.sharding.reshard(
             conv_state_in,
@@ -524,7 +523,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
 # ---------------------------------------------------------------------------
 
 
-class Qwen3NextSparseMoeBlock(nnx.Module):
+class Qwen3_5SparseMoeBlock(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -620,7 +619,7 @@ class Qwen3NextSparseMoeBlock(nnx.Module):
 # ---------------------------------------------------------------------------
 
 
-class Qwen3NextDecoderLayer(nnx.Module):
+class Qwen3_5DecoderLayer(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -637,7 +636,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
 
         if self.is_linear:
             assert mamba_layer_id is not None
-            self.linear_attn = Qwen3NextGatedDeltaNet(
+            self.linear_attn = Qwen3_5GatedDeltaNet(
                 config,
                 layer_id,
                 mamba_layer_id,
@@ -647,7 +646,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
             self.self_attn = None
         else:
             assert kv_layer_id is not None
-            self.self_attn = Qwen3NextFullAttention(
+            self.self_attn = Qwen3_5FullAttention(
                 config,
                 layer_id,
                 kv_layer_id,
@@ -656,7 +655,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
             )
             self.linear_attn = None
 
-        self.mlp = Qwen3NextSparseMoeBlock(config, layer_id, mesh, dtype)
+        self.mlp = Qwen3_5SparseMoeBlock(config, layer_id, mesh, dtype)
 
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -677,7 +676,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        mamba_pool: MambaPool | None,
+        recurrent_state_pool: RecurrentStatePool | None,
         residual: jax.Array | None = None,
         dispatch_info=None,
     ):
@@ -694,9 +693,9 @@ class Qwen3NextDecoderLayer(nnx.Module):
         if self.is_linear:
             slot_idx = forward_batch.mamba_cache_indices
             assert (
-                mamba_pool is not None and slot_idx is not None
-            ), "Qwen3Next linear layers require mamba_pool and mamba_cache_indices"
-            conv_in, rec_in = mamba_pool.get_layer(self.mamba_layer_id, slot_idx)
+                recurrent_state_pool is not None and slot_idx is not None
+            ), "Qwen3_5 linear layers require recurrent_state_pool and mamba_cache_indices"
+            conv_in, rec_in = recurrent_state_pool.get_layer(self.mamba_layer_id, slot_idx)
             hidden_states, new_conv, new_rec = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -724,7 +723,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
 # ---------------------------------------------------------------------------
 
 
-class Qwen3NextModel(nnx.Module):
+class Qwen3_5Model(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -738,7 +737,7 @@ class Qwen3NextModel(nnx.Module):
         layer_types = _layer_types(config)
         # Build dense index maps:
         #   full-attn layers → 0, 1, ..., N_full-1  (used as RadixAttention layer_id)
-        #   linear layers    → 0, 1, ..., N_lin-1   (used as MambaPool layer index)
+        #   linear layers    → 0, 1, ..., N_lin-1   (used as RecurrentStatePool layer index)
         full_dense = -1
         lin_dense = -1
         kv_ids: list[int | None] = []
@@ -765,7 +764,7 @@ class Qwen3NextModel(nnx.Module):
         )
         self.layers = nnx.data(
             [
-                Qwen3NextDecoderLayer(
+                Qwen3_5DecoderLayer(
                     config,
                     layer_id=i,
                     mamba_layer_id=mamba_ids[i],
@@ -786,7 +785,7 @@ class Qwen3NextModel(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        mamba_pool: MambaPool | None = None,
+        recurrent_state_pool: RecurrentStatePool | None = None,
     ):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
@@ -801,15 +800,15 @@ class Qwen3NextModel(nnx.Module):
                 hidden_states,
                 forward_batch,
                 token_to_kv_pool,
-                mamba_pool,
+                recurrent_state_pool,
                 residual,
                 dispatch_info=forward_batch.expert_location_metadata,
             )
             if not layer.is_linear:
                 layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
-            if layer.is_linear and mamba_pool is not None:
-                mamba_pool.write_layer(
+            if layer.is_linear and recurrent_state_pool is not None:
+                recurrent_state_pool.write_layer(
                     layer.mamba_layer_id,
                     forward_batch.mamba_cache_indices,
                     new_conv,
@@ -819,10 +818,10 @@ class Qwen3NextModel(nnx.Module):
         if residual is not None:
             hidden_states = hidden_states + residual
         hidden_states = self.norm(hidden_states)
-        return hidden_states, layers_kv_fused, layers_topk_ids, mamba_pool
+        return hidden_states, layers_kv_fused, layers_topk_ids, recurrent_state_pool
 
 
-class Qwen3NextForCausalLM(nnx.Module):
+class Qwen3_5ForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -832,7 +831,7 @@ class Qwen3NextForCausalLM(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        self.model = Qwen3NextModel(config, dtype=dtype, mesh=mesh)
+        self.model = Qwen3_5Model(config, dtype=dtype, mesh=mesh)
         if not getattr(config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -848,12 +847,12 @@ class Qwen3NextForCausalLM(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
-        mamba_pool: MambaPool | None = None,
+        recurrent_state_pool: RecurrentStatePool | None = None,
     ):
-        hidden_states, layers_kv_fused, layers_topk_ids, new_mamba_pool = self.model(
+        hidden_states, layers_kv_fused, layers_topk_ids, new_recurrent_state_pool = self.model(
             forward_batch,
             token_to_kv_pool,
-            mamba_pool,
+            recurrent_state_pool,
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
@@ -861,8 +860,8 @@ class Qwen3NextForCausalLM(nnx.Module):
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
         # Mirror the Qwen3Moe / other model return contract:
         # (output, layers_kv_fused, needs_write_kv_flag, layers_topk_ids)
-        # Plus the new mamba_pool pytree tail for hybrid-linear models.
-        return output, layers_kv_fused, True, layers_topk_ids, new_mamba_pool
+        # Plus the new recurrent_state_pool pytree tail for hybrid-linear models.
+        return output, layers_kv_fused, True, layers_topk_ids, new_recurrent_state_pool
 
     # ---- weight loading ----------------------------------------------------
     def load_weights(self, model_config: ModelConfig):
@@ -874,7 +873,7 @@ class Qwen3NextForCausalLM(nnx.Module):
         )
         mappings = self._create_weight_mappings()
         loader.load_weights_from_safetensors(mappings)
-        logger.info("Qwen3Next weights loaded successfully!")
+        logger.info("Qwen3_5 weights loaded successfully!")
 
     def _create_weight_mappings(self) -> dict:
         c = self.config
@@ -1063,4 +1062,4 @@ class Qwen3NextForCausalLM(nnx.Module):
         return m
 
 
-EntryClass = Qwen3NextForCausalLM
+EntryClass = Qwen3_5ForCausalLM
