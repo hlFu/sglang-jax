@@ -30,7 +30,6 @@ from sgl_jax.srt.kernels.gated_delta import (
 )
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
-from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_mapping
@@ -41,6 +40,46 @@ from sgl_jax.srt.models.qwen3 import Qwen3MLP
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+
+class RMSNorm(nnx.Module):
+    """Qwen3-Next-style RMSNorm.
+
+    Differs from the standard ``sgl_jax`` ``RMSNorm`` in that the scale
+    parameter is parameterised as a delta from 1.0 (matching HF
+    ``Qwen3NextRMSNorm.forward``: ``output = x/RMS * (1.0 + weight)``). HF
+    initialises the weight to zeros, and the trained values are typically
+    in [-0.5, 1.5] — i.e., centered near 0, not 1. Using the standard
+    multiplicative form would scale activations by ~0 instead of ~1, which
+    is the root cause of the gibberish-output bug.
+
+    The param is named ``scale`` so the weight loader's existing
+    ``...layernorm.scale`` / ``...norm.scale`` target paths keep working.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        *,
+        epsilon: float = 1e-6,
+        param_dtype: jnp.dtype = jnp.float32,
+        scope_name: str = "rms_norm",
+    ):
+        self.epsilon = epsilon
+        self.scale = nnx.Param(
+            jnp.zeros((num_features,), dtype=param_dtype, out_sharding=P(None)),
+        )
+        self.name = scope_name
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        orig_dtype = x.dtype
+        xf = x.astype(jnp.float32)
+        var = jnp.mean(jnp.square(xf), axis=-1, keepdims=True)
+        xf = xf * jax.lax.rsqrt(var + self.epsilon)
+        scale = self.scale[...].astype(jnp.float32)
+        # Broadcast over leading axes; (1.0 + scale) is the HF parameterisation.
+        xf = xf * (1.0 + scale)
+        return xf.astype(orig_dtype)
 
 
 def _layer_types(config) -> list[str]:
