@@ -1,6 +1,6 @@
 """Qwen3-Next (aka Qwen3.5) — hybrid linear + full attention sparse MoE.
 
-Every 4th layer uses standard grouped-query attention with QK-RMSNorm and
+Every 4th layer uses standard grouped-query attention with QK-GemmaRMSNorm and
 partial RoPE; the other layers use Gated DeltaNet linear attention backed by
 a per-request recurrent state and a short causal conv1d state. Every layer is
 a sparse MoE (routed experts + shared expert).
@@ -21,6 +21,7 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
+from transformers.models.qwen3_
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.kernels.gated_delta import (
@@ -38,48 +39,10 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache, RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen3 import Qwen3MLP
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
+
 
 logger = logging.getLogger(__name__)
-
-
-class RMSNorm(nnx.Module):
-    """Qwen3-Next-style RMSNorm.
-
-    Differs from the standard ``sgl_jax`` ``RMSNorm`` in that the scale
-    parameter is parameterised as a delta from 1.0 (matching HF
-    ``Qwen3NextRMSNorm.forward``: ``output = x/RMS * (1.0 + weight)``). HF
-    initialises the weight to zeros, and the trained values are typically
-    in [-0.5, 1.5] — i.e., centered near 0, not 1. Using the standard
-    multiplicative form would scale activations by ~0 instead of ~1, which
-    is the root cause of the gibberish-output bug.
-
-    The param is named ``scale`` so the weight loader's existing
-    ``...layernorm.scale`` / ``...norm.scale`` target paths keep working.
-    """
-
-    def __init__(
-        self,
-        num_features: int,
-        *,
-        epsilon: float = 1e-6,
-        param_dtype: jnp.dtype = jnp.float32,
-        scope_name: str = "rms_norm",
-    ):
-        self.epsilon = epsilon
-        self.scale = nnx.Param(
-            jnp.zeros((num_features,), dtype=param_dtype, out_sharding=P(None)),
-        )
-        self.name = scope_name
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        orig_dtype = x.dtype
-        xf = x.astype(jnp.float32)
-        var = jnp.mean(jnp.square(xf), axis=-1, keepdims=True)
-        xf = xf * jax.lax.rsqrt(var + self.epsilon)
-        scale = self.scale[...].astype(jnp.float32)
-        # Broadcast over leading axes; (1.0 + scale) is the HF parameterisation.
-        xf = xf * (1.0 + scale)
-        return xf.astype(orig_dtype)
 
 
 def _layer_types(config) -> list[str]:
@@ -101,11 +64,6 @@ def linear_attention_layer_ids(config) -> list[int]:
 
 def full_attention_layer_ids(config) -> list[int]:
     return [i for i, t in enumerate(_layer_types(config)) if t == "full_attention"]
-
-
-# ---------------------------------------------------------------------------
-# Full attention block with QK-RMSNorm and partial RoPE
-# ---------------------------------------------------------------------------
 
 
 class Qwen3_5FullAttention(nnx.Module):
@@ -166,16 +124,14 @@ class Qwen3_5FullAttention(nnx.Module):
             mesh=mesh,
             scope_name="o_proj",
         )
-        self.q_norm = RMSNorm(
+        self.q_norm = GemmaRMSNorm(
             self.head_dim,
             epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
             scope_name="q_norm",
         )
-        self.k_norm = RMSNorm(
+        self.k_norm = GemmaRMSNorm(
             self.head_dim,
             epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
             scope_name="k_norm",
         )
         self.rotary_emb = get_rope(
@@ -230,11 +186,6 @@ class Qwen3_5FullAttention(nnx.Module):
         return out, kv_fused
 
 
-# ---------------------------------------------------------------------------
-# Gated DeltaNet (linear attention block)
-# ---------------------------------------------------------------------------
-
-
 class Qwen3_5GatedDeltaNet(nnx.Module):
     """Gated DeltaNet linear-attention layer — shape-correct port of HF ref.
 
@@ -246,7 +197,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         conv1d.bias:    [conv_dim]
         A_log:          [num_v_heads]
         dt_bias:        [num_v_heads]
-        norm.weight:    [head_v_dim]  (RMSNormGated)
+        norm.weight:    [head_v_dim]  (GemmaRMSNormGated)
         out_proj:       [value_dim, hidden]
     """
 
@@ -311,7 +262,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         # Delta-rule params (fp32 for numerical stability).
         self.A_log = nnx.Param(jnp.zeros((self.num_v_heads,), dtype=jnp.float32))
         self.dt_bias = nnx.Param(jnp.ones((self.num_v_heads,), dtype=jnp.float32))
-        # Gated RMSNorm (applied per head along head_v_dim).
+        # Gated GemmaRMSNorm (applied per head along head_v_dim).
         self.rms_scale = nnx.Param(jnp.ones((self.head_v_dim,), dtype=jnp.float32))
 
     # ----- helpers ----------------------------------------------------------
@@ -380,7 +331,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         return q, k, v, z, b, a
 
     def _rms_gate(self, core_attn_out: jax.Array, z: jax.Array) -> jax.Array:
-        """Equivalent of HF ``Qwen3_5RMSNormGated(norm(core) * silu(z))``.
+        """Equivalent of HF ``Qwen3_5GemmaRMSNormGated(norm(core) * silu(z))``.
 
         Input ``core_attn_out`` and ``z`` have shape ``[T, num_v_heads, head_v_dim]``.
         """
@@ -696,16 +647,14 @@ class Qwen3_5DecoderLayer(nnx.Module):
 
         self.mlp = Qwen3_5SparseMoeBlock(config, layer_id, mesh, dtype)
 
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = GemmaRMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
             scope_name="input_layernorm",
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
             scope_name="post_attention_layernorm",
         )
 
@@ -814,10 +763,9 @@ class Qwen3_5Model(nnx.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(
+        self.norm = GemmaRMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
         )
 
     def __call__(
@@ -826,14 +774,17 @@ class Qwen3_5Model(nnx.Module):
         token_to_kv_pool: KVCache,
         recurrent_state_pool: RecurrentStatePool | None = None,
     ):
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        if forward_batch.input_embedding:
+            hidden_states = forward_batch.input_embedding
+        else:
+            hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         # Only full-attention layers emit kv_fused; the outer pool is sized to
         # num_full_attn_layers and `replace_kv_buffer` expects a dense list.
         layers_kv_fused: list = []
         layers_topk_ids: list = []
 
-        for layer in self.layers:
+        for layer_id, layer in enumerate(self.layers):
             hidden_states, residual, kv_fused, topk_ids, new_conv, new_rec = layer(
                 forward_batch.positions,
                 hidden_states,
@@ -843,9 +794,19 @@ class Qwen3_5Model(nnx.Module):
                 residual,
                 dispatch_info=forward_batch.expert_location_metadata,
             )
+
+            if (
+                forward_batch.deepstack_visual_embedding is not None
+                and layer_id < forward_batch.deepstack_visual_embedding.shape[0]
+            ):
+                hidden_states += forward_batch.deepstack_visual_embedding[layer_id].astype(
+                    hidden_states.dtype
+                )
+
             if not layer.is_linear:
                 layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
+
             if layer.is_linear and recurrent_state_pool is not None:
                 recurrent_state_pool.write_layer(
                     layer.mamba_layer_id,
@@ -1100,5 +1061,3 @@ class Qwen3_5ForCausalLM(nnx.Module):
         )
         return m
 
-
-EntryClass = Qwen3_5ForCausalLM
