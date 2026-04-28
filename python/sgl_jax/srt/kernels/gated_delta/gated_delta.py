@@ -253,15 +253,21 @@ def causal_conv1d_prefill(
     prefix = jnp.transpose(state_in, (0, 2, 1))  # [B, kernel-1, D]
     x_padded = jnp.concatenate([prefix, x], axis=1)  # [B, T + kernel-1, D]
 
-    # Depthwise conv: for each t in [0, T), y_t = sum_{i=0..K-1} x_padded[t+i] * w[:, i].
-    # Express as a sum over shifted slices.
-    y = jnp.zeros_like(x)
-    w_f = weight.astype(x.dtype)  # [D, K]
-    for i in range(kernel):
-        # When i corresponds to the *rightmost* kernel tap we use the current
-        # token; leftmost is the oldest in state.
-        tap = x_padded[:, i : i + T, :]  # [B, T, D]
-        y = y + tap * w_f[None, None, :, i]
+    # Depthwise causal conv via lax.conv_general_dilated.
+    # feature_group_count=D splits the D channels into D groups of 1, so each
+    # channel is convolved with its own length-K kernel independently.
+    #   lhs (NWC): [B, T+K-1, D]
+    #   rhs (OIW): [D, 1, K]
+    #   out (NWC): [B, T, D] under VALID padding
+    rhs = weight.astype(x.dtype).reshape(D, 1, kernel)
+    y = jax.lax.conv_general_dilated(
+        lhs=x_padded,
+        rhs=rhs,
+        window_strides=(1,),
+        padding="VALID",
+        dimension_numbers=("NWC", "OIW", "NWC"),
+        feature_group_count=D,
+    )
     if bias is not None:
         y = y + bias.astype(x.dtype)[None, None, :]
     if activation == "silu":
