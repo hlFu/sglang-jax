@@ -20,8 +20,10 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from transformers import PretrainedConfig
-from transformers.models.qwen3_
+from transformers import Qwen3_5MoeTextConfig
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+    Qwen3_5MoeTextConfig,
+)
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.kernels.gated_delta import (
@@ -31,6 +33,7 @@ from sgl_jax.srt.kernels.gated_delta import (
 )
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
+from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_mapping
@@ -39,8 +42,6 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache, RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen3 import Qwen3MLP
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
-from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
-
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ def full_attention_layer_ids(config) -> list[int]:
 class Qwen3_5FullAttention(nnx.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Qwen3_5MoeTextConfig,
         layer_id: int,
         kv_layer_id: int,  # dense index into the (full-attn-only) KV pool
         mesh: jax.sharding.Mesh,
@@ -203,7 +204,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Qwen3_5MoeTextConfig,
         layer_id: int,
         mamba_layer_id: int,  # dense index into RecurrentStatePool (0..num_linear-1)
         mesh: jax.sharding.Mesh,
@@ -359,17 +360,8 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         boundaries come from ``forward_batch.extend_seq_lens`` and the linear-
         attention metadata already on ``forward_batch``.
         """
-        T = hidden_states.shape[0]
-        # RecurrentStatePool leaves replicated; reshape to the tensor-sharded layout the
-        # activations live in so subsequent concats / ops see consistent sharding.
-        conv_state_in = jax.sharding.reshard(
-            conv_state_in,
-            NamedSharding(self.mesh, P(None, "tensor", None)),
-        )
-        recurrent_state_in = jax.sharding.reshard(
-            recurrent_state_in,
-            NamedSharding(self.mesh, P(None, "tensor", None, None)),
-        )
+        seq_len = hidden_states.shape[0]
+
         qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)
         q, k, v, z, b, a = self._split_qkvz_ba(qkvz, ba)
@@ -379,17 +371,17 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         # Tensor sharding sits on the heads axis, so the flattened dim is sharded.
         q_flat = jax.lax.reshape(
             q,
-            (T, self.num_k_heads * self.head_k_dim),
+            (seq_len, self.num_k_heads * self.head_k_dim),
             out_sharding=NamedSharding(self.mesh, P(None, "tensor")),
         )
         k_flat = jax.lax.reshape(
             k,
-            (T, self.num_k_heads * self.head_k_dim),
+            (seq_len, self.num_k_heads * self.head_k_dim),
             out_sharding=NamedSharding(self.mesh, P(None, "tensor")),
         )
         v_flat = jax.lax.reshape(
             v,
-            (T, self.num_v_heads * self.head_v_dim),
+            (seq_len, self.num_v_heads * self.head_v_dim),
             out_sharding=NamedSharding(self.mesh, P(None, "tensor")),
         )
         mixed_qkv = jnp.concatenate([q_flat, k_flat, v_flat], axis=-1)  # [T, conv_dim]
@@ -428,17 +420,17 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         v_mix = conv_out[:, 2 * self.key_dim :]
         q_mix = jax.lax.reshape(
             q_mix,
-            (T, self.num_k_heads, self.head_k_dim),
+            (seq_len, self.num_k_heads, self.head_k_dim),
             out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)),
         )
         k_mix = jax.lax.reshape(
             k_mix,
-            (T, self.num_k_heads, self.head_k_dim),
+            (seq_len, self.num_k_heads, self.head_k_dim),
             out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)),
         )
         v_mix = jax.lax.reshape(
             v_mix,
-            (T, self.num_v_heads, self.head_v_dim),
+            (seq_len, self.num_v_heads, self.head_v_dim),
             out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)),
         )
 
@@ -501,7 +493,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         core_attn_out = self._rms_gate(core_attn_out, z)  # [T, H_v, V]
         core_attn_out = jax.lax.reshape(
             core_attn_out,
-            (T, self.num_v_heads * self.head_v_dim),
+            (seq_len, self.num_v_heads * self.head_v_dim),
             out_sharding=NamedSharding(self.mesh, P(None, "tensor")),
         )
         output, _ = self.out_proj(core_attn_out)
@@ -516,7 +508,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
 class Qwen3_5SparseMoeBlock(nnx.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Qwen3_5MoeTextConfig,
         layer_id: int,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -612,7 +604,7 @@ class Qwen3_5SparseMoeBlock(nnx.Module):
 class Qwen3_5DecoderLayer(nnx.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Qwen3_5MoeTextConfig,
         layer_id: int,
         mamba_layer_id: int | None,  # dense mamba index for linear layers, else None
         kv_layer_id: int | None,  # dense kv index for full layers, else None
@@ -714,7 +706,7 @@ class Qwen3_5DecoderLayer(nnx.Module):
 class Qwen3_5Model(nnx.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Qwen3_5MoeTextConfig,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
@@ -824,7 +816,7 @@ class Qwen3_5Model(nnx.Module):
 class Qwen3_5ForCausalLM(nnx.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Qwen3_5MoeTextConfig,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
@@ -1060,4 +1052,3 @@ class Qwen3_5ForCausalLM(nnx.Module):
             )
         )
         return m
-

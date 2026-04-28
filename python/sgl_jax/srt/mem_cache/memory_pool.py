@@ -1123,8 +1123,20 @@ class RecurrentStatePool:
         Returns:
             ``(conv_in [B, conv_dim, kernel-1], rec_in [B, H, K, V])``.
         """
-        conv = jnp.take(self.conv_state[layer_id], slot_indices, axis=0)
-        rec = jnp.take(self.recurrent_state[layer_id], slot_indices, axis=0)
+        if self.mesh:
+            conv = (
+                self.conv_state[layer_id]
+                .at(slot_indices)
+                .get(out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)))
+            )
+            rec = (
+                self.recurrent_state[layer_id]
+                .at(slot_indices)
+                .get(out_sharding=NamedSharding(self.mesh, P(None, "tensor", None, None)))
+            )
+        else:
+            conv = jnp.take(self.conv_state[layer_id], slot_indices, axis=0)
+            rec = jnp.take(self.recurrent_state[layer_id], slot_indices, axis=0)
         return conv, rec
 
     def write_layer(
