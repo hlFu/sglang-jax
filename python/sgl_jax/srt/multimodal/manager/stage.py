@@ -48,6 +48,9 @@ from sgl_jax.srt.utils import configure_logger
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import get_exception_traceback
 
+from sgl_jax.srt.multimodal.models.qwen3_5_moe.qwen3_5_moe import Qwen3_5ForConditionalGeneration
+from sgl_jax.srt.multimodal.models.qwen3_VL.vision_encoder import Qwen3VLMoeVisionEncoder
+
 logger = logging.getLogger(__name__)
 
 
@@ -252,5 +255,9 @@ def get_model_class(name: str):
         return MiMoAudioTokenizer
     elif name == "MiMoAudioForCausalLM":
         return MiMoAudioForCausalLM
+    elif name == "Qwen3VLMoeVisionEncoder":
+        return Qwen3VLMoeVisionEncoder
+    elif name == "Qwen3_5ForConditionalGeneration":
+        return Qwen3_5ForConditionalGeneration
     else:
         raise ValueError(f"Unknown model name: {name}")
