@@ -219,10 +219,10 @@ def recurrent_gated_delta_step(
 # Causal conv1d (depthwise, kernel_size=K, stride=1, dilation=1)
 # ---------------------------------------------------------------------------
 
-
-def causal_conv1d_prefill(
-    x: jax.Array,  # [B, T, D]  activations
+def jax_causal_conv1d_prefill(
+    x: jax.Array,  # [D, T]  activations
     weight: jax.Array,  # [D, kernel_size]  depthwise weight
+    query_start_loc: jax.Array,
     bias: jax.Array | None = None,  # [D] optional
     initial_state: jax.Array | None = None,  # [B, D, kernel_size-1] carried in
     activation: str | None = None,
@@ -284,7 +284,7 @@ def causal_conv1d_prefill(
     return y, new_state
 
 
-def causal_conv1d_update(
+def jax_causal_conv1d_update(
     x: jax.Array,  # [B, D]  one new token per batch element
     state: jax.Array,  # [B, D, kernel_size-1]
     weight: jax.Array,  # [D, kernel_size]

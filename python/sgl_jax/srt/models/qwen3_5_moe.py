@@ -344,22 +344,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         gated = x * jax.nn.silu(z.astype(jnp.float32))
         return gated.astype(core_attn_out.dtype)
 
-    # ----- forward ----------------------------------------------------------
-    def __call__(
-        self,
-        hidden_states: jax.Array,  # [seq_len, hidden]
-        forward_batch: ForwardBatch,
-        conv_state_in: jax.Array,  # [req_size, conv_dim, kernel-1]
-        recurrent_state_in: jax.Array,  # [req_size, num_v_heads, head_k_dim, head_v_dim] fp32
-    ):
-        """Returns ``(output [seq_len, hidden], new_conv [req_size, conv_dim, K-1], new_rec [req_size, H, K, V])``.
-
-        ``req_size`` is the number of in-flight requests; the kernel expects one state
-        per request. For decode ``seq_len == req_size`` (one token per request). For prefill,
-        each request's tokens are laid out contiguously; the per-request
-        boundaries come from ``forward_batch.extend_seq_lens`` and the linear-
-        attention metadata already on ``forward_batch``.
-        """
+    def forward_in_proj(self, hidden_states: jax.Array):
         seq_len = hidden_states.shape[0]
 
         qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -386,109 +371,31 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         )
         mixed_qkv = jnp.concatenate([q_flat, k_flat, v_flat], axis=-1)  # [seq_len, conv_dim]
 
-        if forward_batch.forward_mode.is_decode():
-            # [seq_len, conv_dim] where seq_len == req_size (one token per request).
-            conv_out, new_conv_state = causal_conv1d_update(
-                mixed_qkv,
-                conv_state_in,
-                self.conv1d_weight.value,
-                bias=None,
-                activation="silu",
-            )
-            new_conv_full = new_conv_state
-        else:
-            # Prefill / extend: current implementation treats the packed batch as
-            # a single logical sequence (req_size=1). Take the first slot's conv state;
-            # we'll pad the new state back to the original req_size at the end.
-            conv_in_b1 = mixed_qkv[None]  # [1, seq_len, conv_dim]
-            init_state_b1 = conv_state_in[:1]
-            conv_out_b1, new_conv_b1 = causal_conv1d_prefill(
-                conv_in_b1,
-                self.conv1d_weight.value,
-                bias=None,
-                initial_state=init_state_b1,
-                activation="silu",
-            )
-            conv_out = conv_out_b1[0]  # [seq_len, conv_dim]
-            # Pad updates back to the full [req_size, conv_dim, K-1] shape (other slots unchanged).
-            new_conv_full = conv_state_in.at[:1].set(new_conv_b1)
-            new_conv_state = new_conv_full
+        return mixed_qkv, z, b, a
 
-        # Split conv output back into Q/K/V.
-        q_mix = conv_out[:, : self.key_dim]
-        k_mix = conv_out[:, self.key_dim : 2 * self.key_dim]
-        v_mix = conv_out[:, 2 * self.key_dim :]
-        q_mix = jax.lax.reshape(
-            q_mix,
-            (seq_len, self.num_k_heads, self.head_k_dim),
-            out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)),
-        )
-        k_mix = jax.lax.reshape(
-            k_mix,
-            (seq_len, self.num_k_heads, self.head_k_dim),
-            out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)),
-        )
-        v_mix = jax.lax.reshape(
-            v_mix,
-            (seq_len, self.num_v_heads, self.head_v_dim),
-            out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)),
-        )
+    
 
-        # Repeat Q/K from num_k_heads up to num_v_heads.
-        if self.num_v_heads != self.num_k_heads:
-            repeat = self.num_v_heads // self.num_k_heads
-            out_sh = NamedSharding(self.mesh, P(None, "tensor", None))
-            q_mix = jnp.repeat(q_mix, repeat, axis=1, out_sharding=out_sh)
-            k_mix = jnp.repeat(k_mix, repeat, axis=1, out_sharding=out_sh)
+    # ----- forward ----------------------------------------------------------
+    def __call__(
+        self,
+        hidden_states: jax.Array,  # [seq_len, hidden]
+        forward_batch: ForwardBatch,
+        conv_state_in: jax.Array,  # [req_size, conv_dim, kernel-1]
+        recurrent_state_in: jax.Array,  # [req_size, num_v_heads, head_k_dim, head_v_dim] fp32
+    ):
+        """Returns ``(output [seq_len, hidden], new_conv [req_size, conv_dim, K-1], new_rec [req_size, H, K, V])``.
 
-        # Compute beta and g.
-        beta = jax.nn.sigmoid(b.astype(jnp.float32))  # [seq_len, num_v_heads]
-        a_f32 = a.astype(jnp.float32)
-        A = jnp.exp(self.A_log.value)
-        g = -A[None] * jax.nn.softplus(a_f32 + self.dt_bias.value[None])  # [seq_len, H_v]
+        ``req_size`` is the number of in-flight requests; the kernel expects one state
+        per request. For decode ``seq_len == req_size`` (one token per request). For prefill,
+        each request's tokens are laid out contiguously; the per-request
+        boundaries come from ``forward_batch.extend_seq_lens`` and the linear-
+        attention metadata already on ``forward_batch``.
+        """
+        seq_len = hidden_states.shape[0]
 
-        if forward_batch.forward_mode.is_decode():
-            # One token per request.  Feed [req_size, 1, H, K/V] to the kernel.
-            q_in = q_mix[:, None]
-            k_in = k_mix[:, None]
-            v_in = v_mix[:, None]
-            g_in = g[:, None]
-            beta_in = beta[:, None]
-            out_bt, new_rec_full = fused_recurrent_gated_delta(
-                q_in,
-                k_in,
-                v_in,
-                g_in,
-                beta_in,
-                initial_state=recurrent_state_in,
-                use_qk_l2norm=True,
-            )
-            core_attn_out = out_bt[:, 0]  # [seq_len, H_v, V]
-            new_rec = new_rec_full  # already [req_size, H, K, V]
-        else:
-            # Prefill: packed [1, seq_len, H, *]. For v1 we require a single-request
-            # prefill: take slot 0's state, scan, and write the update back into
-            # slot 0 of the full state tensor. Multi-request prefill needs the
-            # recurrence to reset at sequence boundaries — handled by the kernel's
-            # cu_seqlens path but requires the state batch dim to match N.
-            q_in = q_mix[None]
-            k_in = k_mix[None]
-            v_in = v_mix[None]
-            g_in = g[None]
-            beta_in = beta[None]
-            init_b1 = recurrent_state_in[:1]
-            out_bt, new_rec_b1 = fused_recurrent_gated_delta(
-                q_in,
-                k_in,
-                v_in,
-                g_in,
-                beta_in,
-                initial_state=init_b1,
-                cu_seqlens=None,
-                use_qk_l2norm=True,
-            )
-            core_attn_out = out_bt[0]  # [seq_len, H_v, V]
-            new_rec = recurrent_state_in.at[:1].set(new_rec_b1)
+        mixed_qkv, z, b, a = self.forward_in_proj(hidden_states)
+
+        core_attn_out = self.attention(forward_batch, mixed_qkv, conv_state_in, recurrent_state_in, b, a)      
 
         core_attn_out = self._rms_gate(core_attn_out, z)  # [seq_len, H_v, V]
         core_attn_out = jax.lax.reshape(
@@ -497,8 +404,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             out_sharding=NamedSharding(self.mesh, P(None, "tensor")),
         )
         output, _ = self.out_proj(core_attn_out)
-        return output, new_conv_state, new_rec
-
+        return output
 
 # ---------------------------------------------------------------------------
 # Sparse MoE block with shared expert
