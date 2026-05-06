@@ -227,61 +227,83 @@ def jax_causal_conv1d_prefill(
     initial_state: jax.Array | None = None,  # [B, D, kernel_size-1] carried in
     activation: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Causal depthwise conv1d across the time axis with state carry.
+    """Depthwise causal conv1d over a ragged-batched packed sequence.
 
-    The state at the end of a sequence is the last ``kernel_size - 1`` token
-    values (ready to be prepended at the next step). For the dense prefill
-    path we prepend ``initial_state`` (zeros for fresh requests) before doing
-    the convolution.
+    Sequences are concatenated along the token axis. Boundaries are given by
+    ``query_start_loc`` (``[0, len_0, len_0+len_1, ...]``). Each output
+    position only mixes inputs from its own request — boundary lookbacks are
+    served from ``initial_state`` if provided, else zero.
 
-    Returns ``(y [B, T, D], new_state [B, D, kernel_size-1])``.
+    Returns ``(y [D, T], final_state [B, D, K-1])``. ``final_state`` holds the
+    last ``K-1`` logical tokens of each request, with left-padding (zero or
+    from ``initial_state``) when the request is shorter than ``K-1``.
     """
-    assert x.ndim == 3, f"x must be [B, T, D], got shape {x.shape}"
-    assert weight.ndim == 2, f"weight must be [D, K], got shape {weight.shape}"
-    B, T, D = x.shape
-    kernel = int(weight.shape[1])
-    assert weight.shape[0] == D
-
-    if initial_state is None:
-        state_in = jnp.zeros((B, D, kernel - 1), dtype=x.dtype)
-    else:
-        assert initial_state.shape == (B, D, kernel - 1)
-        state_in = initial_state.astype(x.dtype)
-
-    # Prepend state across time axis: state_in is "earlier" by up to k-1 steps.
-    # state_in layout: [B, D, kernel-1] with index 0 = oldest.
-    prefix = jnp.transpose(state_in, (0, 2, 1))  # [B, kernel-1, D]
-    x_padded = jnp.concatenate([prefix, x], axis=1)  # [B, T + kernel-1, D]
-
-    # Depthwise causal conv via lax.conv_general_dilated.
-    # feature_group_count=D splits the D channels into D groups of 1, so each
-    # channel is convolved with its own length-K kernel independently.
-    #   lhs (NWC): [B, T+K-1, D]
-    #   rhs (OIW): [D, 1, K]
-    #   out (NWC): [B, T, D] under VALID padding
-    rhs = weight.astype(x.dtype).reshape(D, 1, kernel)
-    y = jax.lax.conv_general_dilated(
-        lhs=x_padded,
-        rhs=rhs,
-        window_strides=(1,),
-        padding="VALID",
-        dimension_numbers=("NWC", "OIW", "NWC"),
-        feature_group_count=D,
-    )
-    if bias is not None:
-        y = y + bias.astype(x.dtype)[None, None, :]
-    if activation == "silu":
-        y = jax.nn.silu(y)
-    elif activation is None:
-        pass
-    else:
+    if activation not in (None, "silu"):
         raise ValueError(f"Unsupported causal conv1d activation: {activation}")
 
-    # New state is the last kernel-1 positions of x_padded (i.e. last kernel-1
-    # input tokens including state if T < kernel-1).
-    tail = x_padded[:, -(kernel - 1) :, :]  # [B, kernel-1, D]
-    new_state = jnp.transpose(tail, (0, 2, 1))  # [B, D, kernel-1]
-    return y, new_state
+    D, T = x.shape
+    K = int(weight.shape[1])
+    B = int(query_start_loc.shape[0]) - 1
+    assert weight.shape == (D, K), f"weight {weight.shape} vs x {x.shape}"
+    if initial_state is not None:
+        assert initial_state.shape == (B, D, K - 1)
+
+    starts = query_start_loc[:-1]  # [B] inclusive
+    ends = query_start_loc[1:]  # [B] exclusive
+    seq_lens = ends - starts  # [B]
+
+    # Map each packed token index to its request id and intra-request position.
+    t_idx = jnp.arange(T)
+    seq_idx = jnp.searchsorted(query_start_loc, t_idx, side="right") - 1  # [T]
+    pos = t_idx - starts[seq_idx]  # [T]
+
+    # Build the depthwise window. For each lookback o in [0, K-1] the source
+    # logical position is p' = pos[t] - o; in-request when p' >= 0, otherwise
+    # served from initial_state slot (K-1) + p' (newest at K-2).
+    o = jnp.arange(K)
+    src_t = t_idx[:, None] - o[None, :]  # [T, K]
+    in_seq = src_t >= starts[seq_idx][:, None]  # [T, K]
+    src_t_safe = jnp.clip(src_t, 0, T - 1)
+    x_gathered = x[:, src_t_safe]  # [D, T, K]
+
+    if initial_state is not None and K > 1:
+        p_prime = pos[:, None] - o[None, :]  # [T, K]
+        is_idx = jnp.clip((K - 1) + p_prime, 0, K - 2)  # [T, K]
+        init_pulled = initial_state[seq_idx[:, None], :, is_idx]  # [T, K, D]
+        init_pulled = jnp.transpose(init_pulled, (2, 0, 1))  # [D, T, K]
+        x_gathered = jnp.where(in_seq[None], x_gathered, init_pulled)
+    elif K > 1:
+        x_gathered = jnp.where(in_seq[None], x_gathered, jnp.zeros_like(x_gathered))
+
+    # weight[d, K-1-o] is the coefficient for lookback o.
+    w_flipped = weight[:, ::-1].astype(x.dtype)  # [D, K]
+    y = jnp.sum(x_gathered * w_flipped[:, None, :], axis=-1)  # [D, T]
+    if bias is not None:
+        y = y + bias.astype(x.dtype)[:, None]
+    if activation == "silu":
+        y = jax.nn.silu(y)
+
+    # Final state: the K-1 most-recent logical tokens of each request.
+    if K > 1:
+        j = jnp.arange(K - 1)[None, :]  # [1, K-1]
+        logical_idx = seq_lens[:, None] - (K - 1) + j  # [B, K-1]
+        take_from_x = logical_idx >= 0
+        src_t_end_safe = jnp.clip(starts[:, None] + logical_idx, 0, T - 1)
+        from_x = jnp.transpose(x[:, src_t_end_safe], (1, 0, 2))  # [B, D, K-1]
+        if initial_state is not None:
+            is_slot = jnp.clip((K - 1) + logical_idx, 0, K - 2)  # [B, K-1]
+            b_idx = jnp.arange(B)[:, None]
+            from_init = initial_state[b_idx, :, is_slot]  # [B, K-1, D]
+            from_init = jnp.transpose(from_init, (0, 2, 1))  # [B, D, K-1]
+            final_state = jnp.where(take_from_x[:, None, :], from_x, from_init)
+        else:
+            final_state = jnp.where(
+                take_from_x[:, None, :], from_x, jnp.zeros_like(from_x)
+            )
+    else:
+        final_state = jnp.zeros((B, D, 0), dtype=x.dtype)
+
+    return y, final_state
 
 
 def jax_causal_conv1d_update(
