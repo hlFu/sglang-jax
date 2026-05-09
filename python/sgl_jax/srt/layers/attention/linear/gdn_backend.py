@@ -5,7 +5,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.layers.attention.gated_delta import (
+from sgl_jax.srt.layers.attention.linear.gated_delta import (
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
     fused_recurrent_gated_delta,
@@ -54,7 +54,7 @@ class GDNAttnBackend(nnx.Module):
         A = jnp.exp(self.A_log.value)
         g = -A[None] * jax.nn.softplus(a_f32 + self.dt_bias.value[None])  # [seq_len, H_v]
 
-        return
+        return 
 
     def __call__(self, 
                   forward_batch: ForwardBatch,
@@ -114,22 +114,19 @@ class GDNAttnBackend(nnx.Module):
             conv_state_in: jax.Array,
             recurrent_state_in: jax.Array,
             ):
-         # Prefill / extend: current implementation treats the packed batch as
-            # a single logical sequence (req_size=1). Take the first slot's conv state;
-            # we'll pad the new state back to the original req_size at the end.
+        # Prefill / extend: current implementation treats the packed batch as
+        # a single logical sequence (req_size=1). Take the first slot's conv state;
+        # we'll pad the new state back to the original req_size at the end.
         conv_in_b1 = mixed_qkv[None]  # [1, seq_len, conv_dim]
-        init_state_b1 = conv_state_in[:1]
-        conv_out_b1, new_conv_b1 = causal_conv1d_prefill(
-            conv_in_b1,
-            self.conv1d_weight.value,
+        conv_out, new_conv_state = causal_conv1d_prefill(
+            x=conv_in_b1,
+            weight=self.conv1d_weight.value,
             bias=None,
-            initial_state=init_state_b1,
+            cu_seqlens=forward_batch.gdn_metadata.cu_seqlens,
+            initial_state=conv_state_in,
+            state_indices=forward_batch.mamba_cache_indices,
             activation="silu",
         )
-        conv_out = conv_out_b1[0]  # [seq_len, conv_dim]
-        # Pad updates back to the full [req_size, conv_dim, K-1] shape (other slots unchanged).
-        new_conv_full = conv_state_in.at[:1].set(new_conv_b1)
-        new_conv_state = new_conv_full
 
         self._prepare()
 

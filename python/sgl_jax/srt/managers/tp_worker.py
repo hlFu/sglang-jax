@@ -592,6 +592,25 @@ class ModelWorker:
             mamba_idx_np = req_pool.get_mamba_indices(model_worker_batch.req_pool_indices)
             forward_batch.mamba_cache_indices = jnp.asarray(mamba_idx_np, dtype=jnp.int32)
 
+            # GDN (gated DeltaNet) metadata: per-forward packed-batch
+            # boundaries.  Cheap to compute even for hybrid models that don't
+            # use GDN — the model is responsible for actually consuming it.
+            from sgl_jax.srt.layers.attention.linear.gdn_metadata import (
+                GDNMetadataBuilder,
+            )
+
+            gdn_builder = getattr(
+                self.worker.model_runner,
+                "gdn_metadata_builder",
+                None,
+            )
+            if gdn_builder is None:
+                gdn_builder = GDNMetadataBuilder(mesh=self.worker.model_runner.mesh)
+                self.worker.model_runner.gdn_metadata_builder = gdn_builder
+            forward_batch.gdn_metadata = gdn_builder.get_forward_metadata(
+                model_worker_batch
+            )
+
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,

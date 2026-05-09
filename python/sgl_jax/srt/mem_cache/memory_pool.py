@@ -1113,31 +1113,8 @@ class RecurrentStatePool:
         return len(self.free_slots)
 
     # --- per-layer access ---------------------------------------------------
-    def get_layer(self, layer_id: int, slot_indices: jax.Array):
-        """Gather the conv and recurrent state for the given slots, one layer.
-
-        Args:
-            layer_id: integer layer index into the pool.
-            slot_indices: ``[B]`` int32 array of slot ids (0 = null slot).
-
-        Returns:
-            ``(conv_in [B, conv_dim, kernel-1], rec_in [B, H, K, V])``.
-        """
-        if self.mesh:
-            conv = (
-                self.conv_state[layer_id]
-                .at(slot_indices)
-                .get(out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)))
-            )
-            rec = (
-                self.recurrent_state[layer_id]
-                .at(slot_indices)
-                .get(out_sharding=NamedSharding(self.mesh, P(None, "tensor", None, None)))
-            )
-        else:
-            conv = jnp.take(self.conv_state[layer_id], slot_indices, axis=0)
-            rec = jnp.take(self.recurrent_state[layer_id], slot_indices, axis=0)
-        return conv, rec
+    def get_layer(self, layer_id: int):
+        return None
 
     def write_layer(
         self,

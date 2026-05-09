@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from sgl_jax.srt.layers.attention.fla.linear_attention_backend import (
         LinearAttentionMetadata,
     )
+    from sgl_jax.srt.layers.attention.linear.gdn_metadata import GDNAttnMetadata
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
@@ -209,6 +210,10 @@ class ForwardBatch:
     linear_attn_metadata: LinearAttentionMetadata | None = None  # type: ignore[name-defined]
     mamba_cache_indices: jax.Array | None = None  # [batch_size] int32
 
+    ## for Gated-Delta-Net layers (Qwen3-Next).  Populated by the model runner
+    ## when GDN layers are present; None otherwise.
+    gdn_metadata: GDNAttnMetadata | None = None  # type: ignore[name-defined]
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -232,6 +237,7 @@ class ForwardBatch:
             self.deepstack_visual_embedding,
             self.linear_attn_metadata,
             self.mamba_cache_indices,
+            self.gdn_metadata,
         )
 
         aux_data = {
@@ -278,6 +284,7 @@ class ForwardBatch:
         obj.deepstack_visual_embedding = children[18]
         obj.linear_attn_metadata = children[19]
         obj.mamba_cache_indices = children[20]
+        obj.gdn_metadata = children[21]
         return obj
 
     def __repr__(self) -> str:

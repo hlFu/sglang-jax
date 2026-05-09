@@ -222,9 +222,10 @@ def recurrent_gated_delta_step(
 def jax_causal_conv1d_prefill(
     x: jax.Array,  # [D, T]  activations
     weight: jax.Array,  # [D, kernel_size]  depthwise weight
-    query_start_loc: jax.Array,
     bias: jax.Array | None = None,  # [D] optional
-    initial_state: jax.Array | None = None,  # [B, D, kernel_size-1] carried in
+    cu_seqlens: jax.Array | None = None,
+    conv_state: jax.Array | None = None,  # [B, D, kernel_size-1] carried in
+    state_indices: jax.Array | None = None,
     activation: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Depthwise causal conv1d over a ragged-batched packed sequence.
@@ -243,18 +244,21 @@ def jax_causal_conv1d_prefill(
 
     D, T = x.shape
     K = int(weight.shape[1])
-    B = int(query_start_loc.shape[0]) - 1
+    B = int(cu_seqlens.shape[0]) - 1
     assert weight.shape == (D, K), f"weight {weight.shape} vs x {x.shape}"
-    if initial_state is not None:
-        assert initial_state.shape == (B, D, K - 1)
 
-    starts = query_start_loc[:-1]  # [B] inclusive
-    ends = query_start_loc[1:]  # [B] exclusive
+    state = None
+    if conv_state is not None:
+        assert conv_state.shape == (B, D, K - 1)
+        state = conv_state[state_indices]
+
+    starts = cu_seqlens[:-1]  # [B] inclusive
+    ends = cu_seqlens[1:]  # [B] exclusive
     seq_lens = ends - starts  # [B]
 
     # Map each packed token index to its request id and intra-request position.
     t_idx = jnp.arange(T)
-    seq_idx = jnp.searchsorted(query_start_loc, t_idx, side="right") - 1  # [T]
+    seq_idx = jnp.searchsorted(cu_seqlens, t_idx, side="right") - 1  # [T]
     pos = t_idx - starts[seq_idx]  # [T]
 
     # Build the depthwise window. For each lookback o in [0, K-1] the source
@@ -266,10 +270,10 @@ def jax_causal_conv1d_prefill(
     src_t_safe = jnp.clip(src_t, 0, T - 1)
     x_gathered = x[:, src_t_safe]  # [D, T, K]
 
-    if initial_state is not None and K > 1:
+    if state is not None and K > 1:
         p_prime = pos[:, None] - o[None, :]  # [T, K]
         is_idx = jnp.clip((K - 1) + p_prime, 0, K - 2)  # [T, K]
-        init_pulled = initial_state[seq_idx[:, None], :, is_idx]  # [T, K, D]
+        init_pulled = conv_state[seq_idx[:, None], :, is_idx]  # [T, K, D]
         init_pulled = jnp.transpose(init_pulled, (2, 0, 1))  # [D, T, K]
         x_gathered = jnp.where(in_seq[None], x_gathered, init_pulled)
     elif K > 1:
@@ -277,7 +281,7 @@ def jax_causal_conv1d_prefill(
 
     # weight[d, K-1-o] is the coefficient for lookback o.
     w_flipped = weight[:, ::-1].astype(x.dtype)  # [D, K]
-    y = jnp.sum(x_gathered * w_flipped[:, None, :], axis=-1)  # [D, T]
+    y = jnp.einsum("dtk,dk->dt", x_gathered, w_flipped)
     if bias is not None:
         y = y + bias.astype(x.dtype)[:, None]
     if activation == "silu":
@@ -290,10 +294,10 @@ def jax_causal_conv1d_prefill(
         take_from_x = logical_idx >= 0
         src_t_end_safe = jnp.clip(starts[:, None] + logical_idx, 0, T - 1)
         from_x = jnp.transpose(x[:, src_t_end_safe], (1, 0, 2))  # [B, D, K-1]
-        if initial_state is not None:
+        if state is not None:
             is_slot = jnp.clip((K - 1) + logical_idx, 0, K - 2)  # [B, K-1]
             b_idx = jnp.arange(B)[:, None]
-            from_init = initial_state[b_idx, :, is_slot]  # [B, K-1, D]
+            from_init = state[b_idx, :, is_slot]  # [B, K-1, D]
             from_init = jnp.transpose(from_init, (0, 2, 1))  # [B, D, K-1]
             final_state = jnp.where(take_from_x[:, None, :], from_x, from_init)
         else:
@@ -303,7 +307,9 @@ def jax_causal_conv1d_prefill(
     else:
         final_state = jnp.zeros((B, D, 0), dtype=x.dtype)
 
-    return y, final_state
+    new_conv_state = conv_state.at(state_indices).set(final_state)
+
+    return y, new_conv_state 
 
 
 def jax_causal_conv1d_update(
