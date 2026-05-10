@@ -32,6 +32,7 @@ from sgl_jax.srt.kernels.gated_delta import (
     fused_recurrent_gated_delta,
 )
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
+from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -256,13 +257,19 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             scope_name="out_proj",
         )
 
-        # Depthwise conv1d weights: [conv_dim, kernel_size] (HF uses bias=False).
-        self.conv1d_weight = nnx.Param(
-            jnp.zeros((self.conv_dim, self.conv_kernel_size), dtype=dtype)
+        # GDN attention backend owns the conv1d weight + delta-rule params
+        # (A_log, dt_bias). Weight loading targets these via
+        # `linear_attn.attention.{conv1d_weight,A_log,dt_bias}`.
+        self.attention = GDNAttnBackend(
+            num_k_heads=self.num_k_heads,
+            num_v_heads=self.num_v_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            conv_dim=self.conv_dim,
+            conv_kernel_size=self.conv_kernel_size,
+            mesh=mesh,
+            dtype=dtype,
         )
-        # Delta-rule params (fp32 for numerical stability).
-        self.A_log = nnx.Param(jnp.zeros((self.num_v_heads,), dtype=jnp.float32))
-        self.dt_bias = nnx.Param(jnp.ones((self.num_v_heads,), dtype=jnp.float32))
         # Gated GemmaRMSNorm (applied per head along head_v_dim).
         self.rms_scale = nnx.Param(jnp.ones((self.head_v_dim,), dtype=jnp.float32))
 
@@ -380,22 +387,23 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self,
         hidden_states: jax.Array,  # [seq_len, hidden]
         forward_batch: ForwardBatch,
-        conv_state_in: jax.Array,  # [req_size, conv_dim, kernel-1]
-        recurrent_state_in: jax.Array,  # [req_size, num_v_heads, head_k_dim, head_v_dim] fp32
-    ):
-        """Returns ``(output [seq_len, hidden], new_conv [req_size, conv_dim, K-1], new_rec [req_size, H, K, V])``.
+        conv_state_in: jax.Array,  # [num_blocks, conv_dim, kernel-1]
+        recurrent_state_in: jax.Array,  # [num_blocks, num_v_heads, head_k_dim, head_v_dim] fp32
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Returns ``(output [seq_len, hidden], new_conv [B, conv_dim, K-1], new_rec [B, H, K, V])``.
 
-        ``req_size`` is the number of in-flight requests; the kernel expects one state
-        per request. For decode ``seq_len == req_size`` (one token per request). For prefill,
-        each request's tokens are laid out contiguously; the per-request
-        boundaries come from ``forward_batch.extend_seq_lens`` and the linear-
-        attention metadata already on ``forward_batch``.
+        ``conv_state_in`` and ``recurrent_state_in`` are the full per-layer
+        state tables; the backend gathers per-request state internally via
+        ``forward_batch.mamba_cache_indices`` and returns per-request new
+        states ready for ``RecurrentStatePool.write_layer``.
         """
         seq_len = hidden_states.shape[0]
 
         mixed_qkv, z, b, a = self.forward_in_proj(hidden_states)
 
-        core_attn_out = self.attention(forward_batch, mixed_qkv, conv_state_in, recurrent_state_in, b, a)      
+        core_attn_out, new_conv, new_rec = self.attention(
+            forward_batch, mixed_qkv, conv_state_in, recurrent_state_in, b, a
+        )
 
         core_attn_out = self._rms_gate(core_attn_out, z)  # [seq_len, H_v, V]
         core_attn_out = jax.lax.reshape(
@@ -404,7 +412,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             out_sharding=NamedSharding(self.mesh, P(None, "tensor")),
         )
         output, _ = self.out_proj(core_attn_out)
-        return output
+        return output, new_conv, new_rec
 
 # ---------------------------------------------------------------------------
 # Sparse MoE block with shared expert
@@ -581,7 +589,10 @@ class Qwen3_5DecoderLayer(nnx.Module):
             assert (
                 recurrent_state_pool is not None and slot_idx is not None
             ), "Qwen3_5 linear layers require recurrent_state_pool and mamba_cache_indices"
-            conv_in, rec_in = recurrent_state_pool.get_layer(self.mamba_layer_id, slot_idx)
+            # Pass the full per-layer state tables; the backend gathers
+            # per-request state internally via mamba_cache_indices.
+            conv_in = recurrent_state_pool.conv_state[self.mamba_layer_id]
+            rec_in = recurrent_state_pool.recurrent_state[self.mamba_layer_id]
             hidden_states, new_conv, new_rec = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -880,7 +891,7 @@ class Qwen3_5ForCausalLM(nnx.Module):
                 # Conv1d weight in HF has shape [conv_dim, 1, kernel]; we store
                 # [conv_dim, kernel]. Use the loader's reshape to drop the group axis.
                 f"{prefix}.{la}.conv1d.weight": WeightMapping(
-                    target_path=f"{prefix}.{ours}.conv1d_weight",
+                    target_path=f"{prefix}.{ours}.attention.conv1d_weight",
                     sharding=("tensor", None),
                     transpose=False,
                     reshape=(
@@ -892,12 +903,12 @@ class Qwen3_5ForCausalLM(nnx.Module):
                     ),
                 ),
                 f"{prefix}.{la}.A_log": WeightMapping(
-                    target_path=f"{prefix}.{ours}.A_log",
+                    target_path=f"{prefix}.{ours}.attention.A_log",
                     sharding=("tensor",),
                     transpose=False,
                 ),
                 f"{prefix}.{la}.dt_bias": WeightMapping(
-                    target_path=f"{prefix}.{ours}.dt_bias",
+                    target_path=f"{prefix}.{ours}.attention.dt_bias",
                     sharding=("tensor",),
                     transpose=False,
                 ),

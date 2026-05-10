@@ -1,157 +1,156 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.layers.attention.linear.gated_delta import (
+    decode_gated_delta_rule_ref,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
-    fused_recurrent_gated_delta,
+    ragged_gated_delta_rule_ref,
 )
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
-causal_conv1d_prefill = jax_causal_conv1d_prefill
-causal_conv1d_update = jax_causal_conv1d_update
 
 class GDNAttnBackend(nnx.Module):
-    def __init__(self):
-        super().__init__()
+    """Gated-DeltaNet attention backend.
 
-    def _prepare(self, conv_out, b, a):
-        seq_len = conv_out.shape[0]
+    Owns the conv1d weight and the gated-delta-rule parameters (``A_log``,
+    ``dt_bias``); the parent layer hands in the full per-layer
+    ``conv_state`` / ``recurrent_state`` tables plus ``mixed_qkv``, ``b``,
+    ``a``. The kernels gather per-request state internally (via
+    ``forward_batch.mamba_cache_indices``) and the backend returns
+    ``(core_attn_out, new_conv, new_rec)`` where ``new_conv`` and
+    ``new_rec`` are per-request — the format
+    ``RecurrentStatePool.write_layer`` expects.
+    """
 
-        # Split conv output back into Q/K/V.
-        q_mix = conv_out[:, : self.key_dim]
-        k_mix = conv_out[:, self.key_dim : 2 * self.key_dim]
-        v_mix = conv_out[:, 2 * self.key_dim :]
-        q_mix = jax.lax.reshape(
-            q_mix,
-            (seq_len, self.num_k_heads, self.head_k_dim),
-            out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)),
+    def __init__(
+        self,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        conv_dim: int,
+        conv_kernel_size: int,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        self.num_k_heads = num_k_heads
+        self.num_v_heads = num_v_heads
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.conv_dim = conv_dim
+        self.conv_kernel_size = conv_kernel_size
+        self.mesh = mesh
+
+        # Depthwise conv1d weight (HF stores [conv_dim, 1, K]; we squeeze).
+        self.conv1d_weight = nnx.Param(
+            jnp.zeros((conv_dim, conv_kernel_size), dtype=dtype)
         )
-        k_mix = jax.lax.reshape(
-            k_mix,
-            (seq_len, self.num_k_heads, self.head_k_dim),
-            out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)),
-        )
-        v_mix = jax.lax.reshape(
-            v_mix,
-            (seq_len, self.num_v_heads, self.head_v_dim),
-            out_sharding=NamedSharding(self.mesh, P(None, "tensor", None)),
-        )
+        # Delta-rule params (fp32 for numerical stability).
+        self.A_log = nnx.Param(jnp.zeros((num_v_heads,), dtype=jnp.float32))
+        self.dt_bias = nnx.Param(jnp.ones((num_v_heads,), dtype=jnp.float32))
 
-        # Repeat Q/K from num_k_heads up to num_v_heads.
-        if self.num_v_heads != self.num_k_heads:
-            repeat = self.num_v_heads // self.num_k_heads
-            out_sh = NamedSharding(self.mesh, P(None, "tensor", None))
-            q_mix = jnp.repeat(q_mix, repeat, axis=1, out_sharding=out_sh)
-            k_mix = jnp.repeat(k_mix, repeat, axis=1, out_sharding=out_sh)
-
-        # Compute beta and g.
-        beta = jax.nn.sigmoid(b.astype(jnp.float32))  # [seq_len, num_v_heads]
-        a_f32 = a.astype(jnp.float32)
-        A = jnp.exp(self.A_log.value)
-        g = -A[None] * jax.nn.softplus(a_f32 + self.dt_bias.value[None])  # [seq_len, H_v]
-
-        return 
-
-    def __call__(self, 
-                  forward_batch: ForwardBatch,
-                  mixed_qkv: jax.Array, 
-                  conv_state_in: jax.Array,
-                  recurrent_state_in: jax.Array,
-                  b: jax.Array,
-                  a: jax.Array,
-                  ):
+    def __call__(
+        self,
+        forward_batch: ForwardBatch,
+        mixed_qkv: jax.Array,
+        conv_state_in: jax.Array,
+        recurrent_state_in: jax.Array,
+        b: jax.Array,
+        a: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         if forward_batch.forward_mode.is_decode():
-            core_attn_out = self.forward_decode(forward_batch, mixed_qkv, conv_state_in, recurrent_state_in)
-        else:
-            core_attn_out = self.forward_extend(forward_batch, mixed_qkv, conv_state_in, recurrent_state_in)
-        
-        return core_attn_out
+            return self.forward_decode(
+                forward_batch, mixed_qkv, conv_state_in, recurrent_state_in, b, a
+            )
+        return self.forward_extend(
+            forward_batch, mixed_qkv, conv_state_in, recurrent_state_in, b, a
+        )
 
-    def forward_decode(self,
-                       forward_batch: ForwardBatch,
-                       mixed_qkv: jax.Array, 
-                       conv_state_in: jax.Array,
-                       recurrent_state_in: jax.Array,
-                  ):
-        # [seq_len, conv_dim] where seq_len == req_size (one token per request).
-        conv_out, new_conv_state = causal_conv1d_update(
+    def forward_decode(
+        self,
+        forward_batch: ForwardBatch,
+        mixed_qkv: jax.Array,
+        conv_state_in: jax.Array,
+        recurrent_state_in: jax.Array,
+        b: jax.Array,
+        a: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Decode-only fast path.
+
+        One token per request — no cross-token dependencies — so the
+        recurrence becomes a single ``_gated_delta_step`` parallelised
+        across the batch axis (via ``decode_gated_delta_rule_ref``)
+        instead of running ``ragged_gated_delta_rule_ref`` with
+        ``cu_seqlens = arange(B+1)`` (which would serialise B independent
+        steps as a ``T=B`` scan).
+        """
+        state_indices = forward_batch.mamba_cache_indices
+        per_req_conv_state = conv_state_in[state_indices]
+        conv_out, new_conv = jax_causal_conv1d_update(
             mixed_qkv,
-            conv_state_in,
+            per_req_conv_state,
             self.conv1d_weight.value,
             bias=None,
             activation="silu",
         )
-
-        self._prepare()
-
-        # One token per request.  Feed [req_size, 1, H, K/V] to the kernel.
-        q_in = q_mix[:, None]
-        k_in = k_mix[:, None]
-        v_in = v_mix[:, None]
-        g_in = g[:, None]
-        beta_in = beta[:, None]
-        out_bt, new_rec_full = fused_recurrent_gated_delta(
-            q_in,
-            k_in,
-            v_in,
-            g_in,
-            beta_in,
-            initial_state=recurrent_state_in,
-            use_qk_l2norm=True,
+        new_rec, core_attn_out = decode_gated_delta_rule_ref(
+            conv_out,
+            b,
+            a,
+            recurrent_state_in,
+            self.A_log.value,
+            self.dt_bias.value,
+            state_indices,
+            n_kq=self.num_k_heads,
+            n_v=self.num_v_heads,
+            d_k=self.head_k_dim,
+            d_v=self.head_v_dim,
         )
-        core_attn_out = out_bt[:, 0]  # [seq_len, H_v, V]
-        new_rec = new_rec_full  # already [req_size, H, K, V]
+        return core_attn_out, new_conv, new_rec
 
-        return core_attn_out
-
-    def forward_extend(self,
-            forward_batch: ForwardBatch,
-            mixed_qkv: jax.Array, 
-            conv_state_in: jax.Array,
-            recurrent_state_in: jax.Array,
-            ):
-        # Prefill / extend: current implementation treats the packed batch as
-        # a single logical sequence (req_size=1). Take the first slot's conv state;
-        # we'll pad the new state back to the original req_size at the end.
-        conv_in_b1 = mixed_qkv[None]  # [1, seq_len, conv_dim]
-        conv_out, new_conv_state = causal_conv1d_prefill(
-            x=conv_in_b1,
+    def forward_extend(
+        self,
+        forward_batch: ForwardBatch,
+        mixed_qkv: jax.Array,
+        conv_state_in: jax.Array,
+        recurrent_state_in: jax.Array,
+        b: jax.Array,
+        a: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        cu_seqlens = forward_batch.gdn_metadata.cu_seqlens
+        state_indices = forward_batch.mamba_cache_indices
+        # jax_causal_conv1d_prefill expects activations as [D, T] and gathers
+        # per-seq prior state from the full per-layer table internally.
+        conv_out_dt, new_conv = jax_causal_conv1d_prefill(
+            x=mixed_qkv.T,
             weight=self.conv1d_weight.value,
             bias=None,
-            cu_seqlens=forward_batch.gdn_metadata.cu_seqlens,
-            initial_state=conv_state_in,
-            state_indices=forward_batch.mamba_cache_indices,
+            cu_seqlens=cu_seqlens,
+            conv_state=conv_state_in,
+            state_indices=state_indices,
             activation="silu",
         )
+        conv_out = conv_out_dt.T  # [T, D]
 
-        self._prepare()
-
-        # Prefill: packed [1, seq_len, H, *]. For v1 we require a single-request
-        # prefill: take slot 0's state, scan, and write the update back into
-        # slot 0 of the full state tensor. Multi-request prefill needs the
-        # recurrence to reset at sequence boundaries — handled by the kernel's
-        # cu_seqlens path but requires the state batch dim to match N.
-        q_in = q_mix[None]
-        k_in = k_mix[None]
-        v_in = v_mix[None]
-        g_in = g[None]
-        beta_in = beta[None]
-        init_b1 = recurrent_state_in[:1]
-        out_bt, new_rec_b1 = fused_recurrent_gated_delta(
-            q_in,
-            k_in,
-            v_in,
-            g_in,
-            beta_in,
-            initial_state=init_b1,
-            cu_seqlens=None,
-            use_qk_l2norm=True,
+        # has_initial_state[i] is True iff request i already has computed
+        # tokens before this extend window — chunked-prefill continuation
+        # or prefix-cache hit. False for brand-new prefills.
+        has_initial_state = forward_batch.extend_prefix_lens > 0
+        new_rec, core_attn_out = ragged_gated_delta_rule_ref(
+            conv_out,
+            b,
+            a,
+            recurrent_state_in,
+            self.A_log.value,
+            self.dt_bias.value,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
+            n_kq=self.num_k_heads,
+            n_v=self.num_v_heads,
+            d_k=self.head_k_dim,
+            d_v=self.head_v_dim,
         )
-        core_attn_out = out_bt[0]  # [seq_len, H_v, V]
-        new_rec = recurrent_state_in.at[:1].set(new_rec_b1)
-
-        return core_attn_out
+        return core_attn_out, new_conv, new_rec
