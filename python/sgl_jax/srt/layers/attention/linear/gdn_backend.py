@@ -75,9 +75,17 @@ class GDNAttnBackend(nnx.Module):
         self.conv1d_weight = nnx.Param(
             jnp.zeros((self.conv_dim, conv_kernel_size), dtype=dtype)
         )
-        # Delta-rule params (fp32 for numerical stability), sharded per-head.
+        # Delta-rule params, sharded per-head. Storage dtypes follow the HF
+        # Qwen3.5 checkpoint exactly:
+        #   A_log:   fp32 (the recurrence's ``-exp(A_log)`` factor is
+        #            numerically sensitive — checkpoint is fp32 and the
+        #            gating kernel reads it as such).
+        #   dt_bias: model dtype (bf16). The gating kernel upcasts to fp32
+        #            internally for ``softplus(a + dt_bias)``; storing fp32
+        #            here would only force a load-time cast and double the
+        #            param footprint with no numerical benefit.
         self.A_log = nnx.Param(jnp.zeros((num_v_heads,), dtype=jnp.float32))
-        self.dt_bias = nnx.Param(jnp.ones((num_v_heads,), dtype=jnp.float32))
+        self.dt_bias = nnx.Param(jnp.ones((num_v_heads,), dtype=dtype))
 
     # ------------------------------------------------------------------
     # Dispatch

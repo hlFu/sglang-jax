@@ -128,6 +128,16 @@ class MergedColumnParallelLinear(LinearBase):
         scope_name: profiling scope.
     """
 
+    @staticmethod
+    def _mesh_tp_size(mesh: jax.sharding.Mesh | None) -> int:
+        """TP size = mesh size on the ``"tensor"`` axis (1 if absent)."""
+        if mesh is None:
+            return 1
+        shape = getattr(mesh, "shape", None)
+        if shape is None or "tensor" not in shape:
+            return 1
+        return int(shape["tensor"])
+
     def __init__(
         self,
         input_size: int,
@@ -156,17 +166,6 @@ class MergedColumnParallelLinear(LinearBase):
             kernel_axes=(None, "tensor"),
             scope_name=scope_name,
         )
-
-    @staticmethod
-    def _mesh_tp_size(mesh: jax.sharding.Mesh | None) -> int:
-        if mesh is None:
-            return 1
-        shape = getattr(mesh, "shape", None)
-        if shape is None or "tensor" not in shape:
-            return 1
-        return int(shape["tensor"])
-
-
 
 class QuantizedLinear(nnx.Module):
     """Quantized linear layer using native quantized matmul.
